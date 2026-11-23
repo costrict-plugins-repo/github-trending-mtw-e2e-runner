@@ -1,0 +1,37 @@
+name: e2e-runner
+image: mcp/e2e-runner
+type: server
+longLived: true
+meta:
+  category: devops
+  tags:
+    - e2e
+    - testing
+    - browser
+    - automation
+    - puppeteer
+    - chrome
+    - devops
+about:
+  title: E2E Runner
+  description: AI-native JSON-driven E2E browser test runner with Chrome pool, parallel execution, visual verification, and learning system. Tests are plain JSON — no JavaScript test files needed.
+  icon: https://avatars.githubusercontent.com/u/1126975?v=4
+source:
+  project: https://github.com/fastslack/mtw-e2e-runner
+  commit: 02f35b2e598337ab6fbfb12695d252403b6106f9
+  dockerfile: Dockerfile
+run:
+  allowHosts:
+    - host.docker.internal:3333
+    - host.docker.internal:3000
+config:
+  description: >
+    Requires a Chrome pool (browserless/chrome) running on the host.
+    Start with: npx -y @matware/e2e-runner@1.6.0 pool start
+  env:
+    - name: BASE_URL
+      example: http://host.docker.internal:3000
+      value: http://host.docker.internal:3000
+    - name: CHROME_POOL_URL
+      example: ws://host.docker.internal:3333
+      value: ws://host.docker.internal:3333

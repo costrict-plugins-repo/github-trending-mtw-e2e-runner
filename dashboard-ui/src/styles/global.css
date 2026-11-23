@@ -1,0 +1,185 @@
+@import "tailwindcss";
+@plugin "daisyui" {
+  themes: business --default;
+}
+
+/* ═══════════════════════════════════════════════
+   Typography
+   ═══════════════════════════════════════════════ */
+@theme {
+  --font-mono: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
+  --font-sans: 'Outfit', -apple-system, sans-serif;
+}
+
+html { font-size: 14px; }
+body {
+  font-family: var(--font-mono);
+}
+::selection { background: oklch(var(--p)); color: oklch(var(--pc)); }
+
+/* ═══════════════════════════════════════════════
+   Color overrides on top of "business" theme
+   ═══════════════════════════════════════════════ */
+[data-theme="business"] {
+  --p: 0.72 0.17 175;    /* teal primary */
+  --pf: 0.66 0.17 175;
+  --pc: 0.15 0.04 175;
+
+  --su: 0.72 0.19 155;   /* vivid green */
+  --wa: 0.80 0.16 75;    /* warm amber */
+  --er: 0.65 0.22 25;    /* crimson */
+}
+
+/* ═══════════════════════════════════════════════
+   Atmosphere — subtle noise grain
+   ═══════════════════════════════════════════════ */
+#app::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 9999;
+  opacity: 0.02;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-repeat: repeat;
+  background-size: 256px;
+}
+
+/* ═══════════════════════════════════════════════
+   Scrollbars
+   ═══════════════════════════════════════════════ */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: oklch(var(--bc) / 0.1); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: oklch(var(--bc) / 0.2); }
+
+/* ═══════════════════════════════════════════════
+   Card & Surface enhancements
+   ═══════════════════════════════════════════════ */
+.card {
+  border-color: oklch(var(--bc) / 0.06) !important;
+  box-shadow:
+    0 1px 2px oklch(0 0 0 / 0.15),
+    inset 0 1px 0 oklch(var(--bc) / 0.03);
+  transition: all 0.25s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.card:hover {
+  border-color: oklch(var(--p) / 0.25) !important;
+  box-shadow:
+    0 4px 20px oklch(var(--p) / 0.06),
+    0 1px 3px oklch(0 0 0 / 0.2),
+    inset 0 1px 0 oklch(var(--bc) / 0.04);
+}
+
+/* ═══════════════════════════════════════════════
+   Glow effects
+   ═══════════════════════════════════════════════ */
+.badge-success { text-shadow: 0 0 8px oklch(var(--su) / 0.5); }
+.badge-error   { text-shadow: 0 0 8px oklch(var(--er) / 0.5); }
+.badge-primary { text-shadow: 0 0 8px oklch(var(--p) / 0.5); }
+
+.btn-primary {
+  box-shadow: 0 0 12px oklch(var(--p) / 0.2), 0 1px 2px oklch(0 0 0 / 0.3);
+}
+.btn-primary:hover {
+  box-shadow: 0 0 20px oklch(var(--p) / 0.35), 0 2px 4px oklch(0 0 0 / 0.3);
+}
+
+.stat-value.text-success { text-shadow: 0 0 12px oklch(var(--su) / 0.3); }
+.stat-value.text-error   { text-shadow: 0 0 12px oklch(var(--er) / 0.3); }
+.stat-value.text-warning { text-shadow: 0 0 12px oklch(var(--wa) / 0.3); }
+.stat-value.text-primary { text-shadow: 0 0 12px oklch(var(--p) / 0.3); }
+
+/* Tab active glow */
+.tabs-bordered .tab-active {
+  border-bottom-color: oklch(var(--p)) !important;
+  text-shadow: 0 0 10px oklch(var(--p) / 0.3);
+}
+
+.checkbox-primary:checked {
+  box-shadow: 0 0 8px oklch(var(--p) / 0.3);
+}
+
+.select:focus, .input:focus {
+  border-color: oklch(var(--p) / 0.5);
+  box-shadow: 0 0 0 2px oklch(var(--p) / 0.08);
+}
+
+/* ═══════════════════════════════════════════════
+   Run Detail — elevated panel when expanded
+   ═══════════════════════════════════════════════ */
+.run-detail-panel {
+  background: oklch(var(--b2));
+  border-top: 2px solid oklch(var(--p) / 0.3);
+  box-shadow:
+    inset 0 4px 16px oklch(var(--p) / 0.04),
+    inset 0 1px 0 oklch(var(--bc) / 0.04);
+  animation: detailSlide 0.25s ease;
+}
+@keyframes detailSlide {
+  from { opacity: 0; max-height: 0; }
+  to { opacity: 1; max-height: 2000px; }
+}
+
+/* Summary card inside detail */
+.run-summary-card {
+  background: oklch(var(--b3));
+  border: 1px solid oklch(var(--bc) / 0.08);
+  border-radius: 10px;
+  box-shadow: 0 2px 8px oklch(0 0 0 / 0.2);
+}
+
+/* Section panels (Actions, Console, Network) */
+.detail-section {
+  border: 1px solid oklch(var(--bc) / 0.08);
+  border-radius: 10px;
+  overflow: hidden;
+  margin-bottom: 10px;
+  box-shadow: 0 1px 4px oklch(0 0 0 / 0.15);
+}
+.detail-section-header {
+  background: oklch(var(--b2));
+  padding: 10px 14px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.detail-section-header:hover {
+  background: oklch(var(--bc) / 0.05);
+}
+
+/* Test result cards — stronger presence */
+.test-result-card {
+  border: 1px solid oklch(var(--bc) / 0.08);
+  border-left-width: 4px;
+  border-radius: 10px;
+  margin-bottom: 10px;
+  overflow: hidden;
+  transition: all 0.2s;
+  box-shadow: 0 1px 4px oklch(0 0 0 / 0.15);
+}
+.test-result-card:hover {
+  box-shadow: 0 4px 12px oklch(0 0 0 / 0.25);
+}
+.test-result-card.pass { border-left-color: oklch(var(--su)); }
+.test-result-card.fail { border-left-color: oklch(var(--er)); }
+.test-result-card.flaky { border-left-color: oklch(var(--wa)); }
+
+/* Expanded row highlight in table */
+tr.run-expanded {
+  background: oklch(var(--p) / 0.06) !important;
+}
+tr.run-expanded td {
+  color: oklch(var(--bc));
+}
+
+/* ═══════════════════════════════════════════════
+   Animations
+   ═══════════════════════════════════════════════ */
+@keyframes fadeSlide {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}

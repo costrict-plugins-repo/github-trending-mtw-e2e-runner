@@ -1,0 +1,90 @@
+/**
+ * @matware/e2e-runner — Programmatic API
+ *
+ * Usage:
+ *   import { createRunner } from '@matware/e2e-runner';
+ *   const runner = await createRunner({ baseUrl: 'http://localhost:3000' });
+ *   const report = await runner.runAll();
+ */
+
+export { loadConfig } from './config.js';
+export { waitForPool, connectToPool, disconnectFromPool, startPool, stopPool, restartPool, getPoolStatus, clearDriverCache, getCachedDriver, trackCdpSession, releaseCdpSession, releaseSteelSession } from './pool.js';
+export { getPoolUrls, getAllPoolStatuses, getAggregatedPoolStatus, waitForAnyPool, selectPool, selectAndConnect } from './pool-manager.js';
+export { executeAction } from './actions.js';
+export { runTest, runTestsParallel, loadTestFile, loadTestSuite, loadAllSuites, listSuites, fetchAuthToken } from './runner.js';
+export { generateReport, generateJUnitXML, saveReport, printReport, saveHistory, loadHistory, loadHistoryRun } from './reporter.js';
+export { startDashboard, stopDashboard } from './dashboard.js';
+export { fetchIssue, parseIssueUrl, detectProvider, checkCliAuth } from './issues.js';
+export { buildPrompt, generateTests, hasApiKey } from './ai-generate.js';
+export { verifyIssue } from './verify.js';
+export { resolveTestData, loadModuleRegistry, listModules } from './module-resolver.js';
+export { learnFromRun, categorizeError, isInfraError, INFRA_CATEGORIES } from './learner.js';
+export { getLearningsSummary, getFlakySummary, getSelectorStability, getPageHealth, getApiHealth, getErrorPatterns, getTestTrends, getRunInsights, getTestCreationContext, generateImprovements, getActionHealthScores } from './learner-sqlite.js';
+export { generateLearningsMarkdown } from './learner-markdown.js';
+export { writeToGraph, queryGraph, closeNeo4j } from './learner-neo4j.js';
+export { startNeo4j, stopNeo4j, getNeo4jStatus } from './neo4j-pool.js';
+export { forkAppInstance, destroyFork, destroyAllForks, getAppPoolStatus, isAppPoolEnabled } from './app-pool.js';
+export { compareImages, assertVisualMatch } from './visual-diff.js';
+// Stable embed API (also available as '@matware/e2e-runner/embed') — see docs/embedding.md
+export { runSuite, inspectPage, toRunResult, RUN_RESULT_SCHEMA_VERSION, INSPECT_RESULT_SCHEMA_VERSION } from './embed.js';
+
+import { loadConfig } from './config.js';
+import { waitForAnyPool, getPoolUrls } from './pool-manager.js';
+import { runTestsParallel, loadTestFile, loadTestSuite, loadAllSuites } from './runner.js';
+import { generateReport, saveReport, printReport } from './reporter.js';
+
+/**
+ * Creates a runner instance with custom configuration
+ * @param {object} userConfig - Configuration overrides
+ * @returns {object} Runner with runAll, runSuite, runTests, runFile methods
+ */
+export async function createRunner(userConfig = {}) {
+  const config = await loadConfig(userConfig);
+
+  return {
+    config,
+
+    /** Runs all test suites from the tests directory */
+    async runAll() {
+      await waitForAnyPool(getPoolUrls(config));
+      const { tests, hooks } = loadAllSuites(config.testsDir, config.modulesDir, config.exclude);
+      const results = await runTestsParallel(tests, config, hooks);
+      const report = generateReport(results);
+      saveReport(report, config.screenshotsDir, config);
+      printReport(report, config.screenshotsDir);
+      return report;
+    },
+
+    /** Runs a single suite by name */
+    async runSuite(name) {
+      await waitForAnyPool(getPoolUrls(config));
+      const { tests, hooks } = loadTestSuite(name, config.testsDir, config.modulesDir);
+      const results = await runTestsParallel(tests, config, hooks);
+      const report = generateReport(results);
+      saveReport(report, config.screenshotsDir, config);
+      printReport(report, config.screenshotsDir);
+      return report;
+    },
+
+    /** Runs an array of test objects */
+    async runTests(tests) {
+      await waitForAnyPool(getPoolUrls(config));
+      const results = await runTestsParallel(tests, config);
+      const report = generateReport(results);
+      saveReport(report, config.screenshotsDir, config);
+      printReport(report, config.screenshotsDir);
+      return report;
+    },
+
+    /** Runs tests from a JSON file path */
+    async runFile(filePath) {
+      await waitForAnyPool(getPoolUrls(config));
+      const { tests, hooks } = loadTestFile(filePath, config.modulesDir);
+      const results = await runTestsParallel(tests, config, hooks);
+      const report = generateReport(results);
+      saveReport(report, config.screenshotsDir, config);
+      printReport(report, config.screenshotsDir);
+      return report;
+    },
+  };
+}

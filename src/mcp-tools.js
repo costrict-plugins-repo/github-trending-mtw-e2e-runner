@@ -1,0 +1,2149 @@
+/**
+ * Shared MCP tool definitions and handlers.
+ *
+ * Used by both the stdio MCP server (src/mcp-server.js) and the
+ * Streamable HTTP transport mounted on the dashboard (src/dashboard.js).
+ *
+ * Kept in its own module so importing it does NOT trigger the
+ * console.log→stderr redirect that mcp-server.js applies.
+ */
+
+import fs from 'fs';
+import path from 'path';
+import http from 'http';
+
+import { loadConfig } from './config.js';
+import { connectToPool, disconnectFromPool } from './pool.js';
+import { waitForAnyPool, getPoolUrls, getAggregatedPoolStatus, selectPool, releasePending } from './pool-manager.js';
+import { runTestsParallel, loadTestFile, loadTestSuite, loadAllSuites, listSuites, fetchAuthToken } from './runner.js';
+import { generateReport, saveReport, persistRun } from './reporter.js';
+import { narrateTest } from './narrate.js';
+import { startDashboard, stopDashboard } from './dashboard.js';
+import { lookupScreenshotHash, ensureProject, computeScreenshotHash, registerScreenshotHash, getNetworkLogs, setVariable, getVariables, deleteVariable, listVariables } from './db.js';
+import { fetchIssue, checkCliAuth, detectProvider } from './issues.js';
+import { buildPrompt, hasApiKey, generateHindsightHint } from './ai-generate.js';
+import { verifyIssue } from './verify.js';
+import { listModules, loadModuleRegistry } from './module-resolver.js';
+import { getLearningsSummary, getFlakySummary, getSelectorStability, getPageHealth, getApiHealth, getErrorPatterns, getTestTrends, getRunInsights, getTestHistory, getPageHistory, getSelectorHistory, getHealthSnapshot, getTestCreationContext, generateImprovements, getActionHealthScores } from './learner-sqlite.js';
+import { queryGraph } from './learner-neo4j.js';
+import { startNeo4j, stopNeo4j, getNeo4jStatus } from './neo4j-pool.js';
+import { getAppPoolStatus, isAppPoolEnabled } from './app-pool.js';
+import { looksLikeBlankCapture } from './actions.js';
+import { extractPageStructure, buildSuggestedTests, smartNavigate } from './page-analysis.js';
+
+/**
+ * Resolves auth token from config: uses static authToken if set,
+ * otherwise auto-logs in via authLoginEndpoint + authCredentials.
+ * If the endpoint is a Docker-internal hostname (e.g. "nginx", "api")
+ * and fails with ENOTFOUND, retries with localhost.
+ * Returns the token string or null if no auth is configured.
+ */
+async function resolveAuthToken(config) {
+  if (config.authToken) return config.authToken;
+  if (config.authLoginEndpoint && config.authCredentials) {
+    const tokenPath = config.authTokenPath || 'token';
+    try {
+      return await fetchAuthToken(config.authLoginEndpoint, config.authCredentials, tokenPath);
+    } catch (err) {
+      // Docker-internal hostname? Retry with localhost from host machine
+      if (err.message && err.message.includes('ENOTFOUND')) {
+        const url = new URL(config.authLoginEndpoint);
+        if (!url.hostname.includes('.')) {
+          // Simple hostname (nginx, api, etc.) → likely Docker service name
+          const localhostUrl = `http://localhost${url.port && url.port !== '80' ? ':' + url.port : ''}${url.pathname}${url.search}`;
+          return await fetchAuthToken(localhostUrl, config.authCredentials, tokenPath);
+        }
+      }
+      throw err;
+    }
+  }
+  return null;
+}
+
+// ── Tool definitions ──────────────────────────────────────────────────────────
+
+export const TOOLS = [
+  {
+    name: 'e2e_run',
+    description:
+      'Run E2E browser tests. Specify "all" to run every suite, "suite" for a specific suite, or "file" for a JSON file path. Returns structured results with pass/fail status, duration, and error details.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        all: {
+          type: 'boolean',
+          description: 'Run all test suites from the tests directory',
+        },
+        suite: {
+          type: 'string',
+          description: 'Suite name to run (e.g. "auth", "01-login"). Matches with or without numeric prefix.',
+        },
+        file: {
+          type: 'string',
+          description: 'Absolute or relative path to a JSON test file',
+        },
+        concurrency: {
+          type: 'number',
+          description: 'Number of parallel workers (default from config)',
+        },
+        baseUrl: {
+          type: 'string',
+          description: 'Override the base URL for this run',
+        },
+        retries: {
+          type: 'number',
+          description: 'Number of retries for failed tests',
+        },
+        failOnNetworkError: {
+          type: 'boolean',
+          description: 'Fail tests when network requests fail (e.g. ERR_CONNECTION_REFUSED). Default: false.',
+        },
+        verificationStrictness: {
+          type: 'string',
+          enum: ['strict', 'moderate', 'lenient'],
+          description: 'Visual verification strictness. strict: no ambiguity allowed, any doubt = FAIL. moderate: reasonable judgment (default). lenient: only fail on clear contradictions.',
+        },
+        cwd: {
+          type: 'string',
+          description: 'Project root directory (defaults to the current working directory).',
+        },
+      },
+    },
+  },
+  {
+    name: 'e2e_list',
+    description:
+      'List all available E2E test suites with their test names and counts.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        cwd: {
+          type: 'string',
+          description: 'Project root directory (defaults to the current working directory).',
+        },
+      },
+    },
+  },
+  {
+    name: 'e2e_create_test',
+    description:
+      `Create a new E2E test JSON file. Prefer built-in actions over evaluate — more robust and readable. Full catalog: the e2e-testing skill / references/action-types.md.
+
+Action cheat-sheet:
+- Click: click (by text), click_regex, click_menu_item, click_option, click_chip, click_icon, click_in_context; in a dialog use click with scope:"dialog" (+ last/visible).
+- Select (MUI): select_combobox (open+optional filter+pick), select, focus_autocomplete.
+- Assert text: assert_text (present), assert_no_text (absent), assert_text_in (scoped regex), assert_element_text, assert_matches.
+- Assert elements (selector, NOT text): assert_visible, assert_not_visible, assert_count, assert_attribute, assert_input_value, assert_url.
+- Nav/wait: goto, navigate (SPA), wait {text|selector|gone|value(ms)}, wait_network_idle.
+- Form: type, type_react (React inputs; optional blur/waitAfter), clear, press.
+
+Field rules: assert_text/assert_no_text use "text" (whole page); assert_visible/assert_not_visible use "selector"; for text absence use assert_no_text. Use evaluate only for computed styles, complex logic, GraphQL (window.__e2eGql), or app state.
+
+Modules: { "$use": "module-name", "params": {...} } references reusable modules in e2e/modules/ (they compose). Run e2e_list to see available modules.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: {
+          type: 'string',
+          description: 'Suite file name without .json extension (e.g. "login-flow", "issue-1743-sidebar")',
+        },
+        tests: {
+          type: 'array',
+          description: 'Array of test objects with { name, actions, expect }',
+          items: {
+            type: 'object',
+            properties: {
+              name: { type: 'string', description: 'Test name — descriptive of what is being verified' },
+              expect: {
+                oneOf: [
+                  { type: 'string', description: 'Single description of expected visual outcome.' },
+                  { type: 'array', items: { type: 'string' }, description: 'Checklist of criteria — each evaluated independently as PASS/FAIL.' },
+                ],
+                description: 'Expected visual outcome. String for free-form, array for per-criterion checklist.',
+              },
+              actions: {
+                type: 'array',
+                description: 'Sequential browser actions. Prefer built-in action types over evaluate — see tool description for the full guide.',
+                items: {
+                  type: 'object',
+                  properties: {
+                    type: {
+                      type: 'string',
+                      description: 'Action type. Prefer declarative actions (assert_text, assert_no_text, click, assert_visible, assert_count, assert_text_in, click_menu_item, etc.) over evaluate.',
+                    },
+                    selector: { type: 'string', description: 'CSS selector (supports compound selectors like "[class*=\'Drawer\'], [role=\'presentation\']")' },
+                    value: { type: 'string', description: 'Value — varies by action type (URL for goto, ms for wait, regex for assert_matches, ">= N" for assert_count)' },
+                    text: { type: 'string', description: 'Text to match — used by click (substring), assert_text/assert_no_text (substring on body), assert_text_in (regex), click_regex (regex). NOT used by assert_visible/assert_not_visible (use selector instead).' },
+                  },
+                  required: ['type'],
+                },
+              },
+            },
+            required: ['name', 'actions'],
+          },
+        },
+        hooks: {
+          type: 'object',
+          description: 'Optional hooks: beforeAll, afterAll, beforeEach, afterEach (each an array of actions). Note: beforeAll runs on a SEPARATE page that is closed before tests — use beforeEach for auth/setup.',
+          properties: {
+            beforeAll: { type: 'array', items: { type: 'object' } },
+            afterAll: { type: 'array', items: { type: 'object' } },
+            beforeEach: { type: 'array', items: { type: 'object' } },
+            afterEach: { type: 'array', items: { type: 'object' } },
+          },
+        },
+        cwd: {
+          type: 'string',
+          description: 'Project root directory (defaults to the current working directory).',
+        },
+      },
+      required: ['name', 'tests'],
+    },
+  },
+  {
+    name: 'e2e_pool_status',
+    description:
+      'Get the status of the Chrome pool (browserless/chrome). Shows availability, running sessions, capacity, and queued requests.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        cwd: {
+          type: 'string',
+          description: 'Project root directory (defaults to the current working directory).',
+        },
+      },
+    },
+  },
+  {
+    name: 'e2e_app_pool_status',
+    description:
+      'Get the status of the app environment pool. Shows active forks, allocated ports, per-fork details (driver, baseUrl, test name, fork time). Only relevant when appPool is enabled in config.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        cwd: {
+          type: 'string',
+          description: 'Absolute path to the project root directory.',
+        },
+      },
+    },
+  },
+  {
+    name: 'e2e_screenshot',
+    description:
+      'Retrieve a screenshot by its hash (e.g. ss:a3f2b1c9). Returns the image. Hashes are shown in the dashboard next to screenshots.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        hash: {
+          type: 'string',
+          description: 'Screenshot hash with or without ss: prefix (e.g. "ss:a3f2b1c9" or "a3f2b1c9")',
+        },
+      },
+      required: ['hash'],
+    },
+  },
+  {
+    name: 'e2e_dashboard_start',
+    description:
+      'Start the E2E Runner web dashboard. Provides a real-time UI for running tests, viewing results, screenshots, history, and pool status.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        port: {
+          type: 'number',
+          description: 'Dashboard port (default 8484)',
+        },
+        cwd: {
+          type: 'string',
+          description: 'Project root directory (defaults to the current working directory).',
+        },
+      },
+    },
+  },
+  {
+    name: 'e2e_dashboard_stop',
+    description: 'Stop the E2E Runner web dashboard.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+    },
+  },
+  {
+    name: 'e2e_dashboard_restart',
+    description:
+      'Restart the E2E Runner web dashboard. Stops the current instance and starts a new one, optionally with a new cwd or port. Useful when switching projects or when the dashboard was started from another session.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        port: {
+          type: 'number',
+          description: 'Dashboard port (default: same port or 8484)',
+        },
+        cwd: {
+          type: 'string',
+          description: 'Project root directory (defaults to the current working directory).',
+        },
+      },
+    },
+  },
+  {
+    name: 'e2e_issue',
+    description:
+      'Fetch a GitHub/GitLab issue and prepare E2E test generation. Returns issue details and a prompt for test creation. Use mode "verify" to auto-generate and run tests (requires ANTHROPIC_API_KEY).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url: {
+          type: 'string',
+          description: 'Issue URL (GitHub or GitLab)',
+        },
+        mode: {
+          type: 'string',
+          enum: ['prompt', 'verify'],
+          description:
+            'prompt = return issue + prompt for Claude Code to create tests (default). verify = auto-generate tests via Claude API and run them.',
+        },
+        testType: {
+          type: 'string',
+          enum: ['e2e', 'api'],
+          description: "Test category: 'e2e' (default) for UI-driven tests, 'api' for backend API tests",
+        },
+        authToken: {
+          type: 'string',
+          description: 'JWT or auth token to inject into localStorage before running tests (for authenticated apps)',
+        },
+        authStorageKey: {
+          type: 'string',
+          description: 'localStorage key name for the auth token (default: "accessToken")',
+        },
+        cwd: {
+          type: 'string',
+          description: 'Project root directory (defaults to the current working directory).',
+        },
+      },
+      required: ['url'],
+    },
+  },
+  {
+    name: 'e2e_capture',
+    description:
+      'Capture a screenshot of any URL on demand. Connects to the Chrome pool, navigates to the URL, takes a screenshot, and returns the image with its ss:HASH.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url: {
+          type: 'string',
+          description: 'Full URL to capture (e.g. "https://example.com" or "http://host.docker.internal:3000/dashboard")',
+        },
+        filename: {
+          type: 'string',
+          description: 'Output filename (default: capture-<timestamp>.png)',
+        },
+        fullPage: {
+          type: 'boolean',
+          description: 'Capture full scrollable page (default: false)',
+        },
+        selector: {
+          type: 'string',
+          description: 'Wait for this CSS selector before capturing',
+        },
+        delay: {
+          type: 'number',
+          description: 'Wait N milliseconds after page load before capturing (default: 0)',
+        },
+        authToken: {
+          type: 'string',
+          description: 'JWT or auth token to inject into localStorage before navigating (for authenticated pages)',
+        },
+        authStorageKey: {
+          type: 'string',
+          description: 'localStorage key name for the auth token (default: "accessToken")',
+        },
+        waitUntil: {
+          type: 'string',
+          enum: ['networkidle2', 'domcontentloaded', 'load', 'auto'],
+          description: 'Navigation wait strategy. "auto" (default) tries networkidle2 first with a short timeout, then falls back to domcontentloaded + delay for SPA/WebSocket apps. Use "domcontentloaded" for apps with persistent connections (WebSocket, SSE).',
+        },
+        cwd: {
+          type: 'string',
+          description: 'Project root directory (defaults to the current working directory).',
+        },
+      },
+      required: ['url'],
+    },
+  },
+  {
+    name: 'e2e_analyze',
+    description:
+      'Analyze a page\'s structure and return all interactive elements (forms, buttons, links, navigation, tables, modals, etc.) with their CSS selectors, plus suggested test scaffolds. One call replaces the entire screenshot→guess-selectors→retry cycle.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url: {
+          type: 'string',
+          description: 'Full URL to analyze (e.g. "https://example.com" or "http://host.docker.internal:3000/dashboard")',
+        },
+        scope: {
+          type: 'string',
+          description: 'CSS selector to limit analysis to a section (e.g. "#sidebar", ".modal-content")',
+        },
+        maxElements: {
+          type: 'number',
+          description: 'Max elements per category (default: 50). Lower values produce smaller responses.',
+        },
+        includeScreenshot: {
+          type: 'boolean',
+          description: 'Include a screenshot alongside the JSON analysis (default: true)',
+        },
+        selector: {
+          type: 'string',
+          description: 'Wait for this CSS selector before analyzing',
+        },
+        delay: {
+          type: 'number',
+          description: 'Wait N milliseconds after page load before analyzing (default: 0)',
+        },
+        authToken: {
+          type: 'string',
+          description: 'JWT or auth token to inject into localStorage before navigating (for authenticated pages)',
+        },
+        authStorageKey: {
+          type: 'string',
+          description: 'localStorage key name for the auth token (default: "accessToken")',
+        },
+        waitUntil: {
+          type: 'string',
+          enum: ['networkidle2', 'domcontentloaded', 'load', 'auto'],
+          description: 'Navigation wait strategy. "auto" (default) tries networkidle2 first with a short timeout, then falls back to domcontentloaded + delay for SPA/WebSocket apps. Use "domcontentloaded" for apps with persistent connections (WebSocket, SSE).',
+        },
+        cwd: {
+          type: 'string',
+          description: 'Project root directory (defaults to the current working directory).',
+        },
+      },
+      required: ['url'],
+    },
+  },
+  {
+    name: 'e2e_create_module',
+    description:
+      `Create a reusable module for E2E tests. Modules encapsulate repeated action sequences referenced via { "$use": "module-name", "params": {...} }.
+
+Good module candidates: auth setup, page navigation, tab clicking, opening sidebars/drawers, form fill sequences, cleanup routines. Modules can compose — a module can $use other modules. Params use {{paramName}} mustache syntax in action fields. Extract a module when you see the same 2+ action sequence in multiple tests.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: {
+          type: 'string',
+          description: 'Module name (used in $use references, e.g. "auth-jwt", "navigate-patient")',
+        },
+        description: {
+          type: 'string',
+          description: 'Human-readable description of what this module does',
+        },
+        params: {
+          type: 'object',
+          description: 'Parameter definitions. Each key is a param name, value is { required: boolean, default?: string, description?: string }',
+          additionalProperties: {
+            type: 'object',
+            properties: {
+              required: { type: 'boolean' },
+              default: { type: 'string' },
+              description: { type: 'string' },
+            },
+          },
+        },
+        actions: {
+          type: 'array',
+          description: 'Sequential actions with {{param}} placeholders for substitution',
+          items: {
+            type: 'object',
+            properties: {
+              type: { type: 'string', description: 'Action type (goto, click, evaluate, wait, etc.) or omit for $use references' },
+              selector: { type: 'string' },
+              value: { type: 'string' },
+              text: { type: 'string' },
+              $use: { type: 'string', description: 'Reference another module by name' },
+              params: { type: 'object', description: 'Parameters for nested $use' },
+            },
+          },
+        },
+        cwd: {
+          type: 'string',
+          description: 'Absolute path to the project root directory.',
+        },
+      },
+      required: ['name', 'actions'],
+    },
+  },
+  {
+    name: 'e2e_learnings',
+    description:
+      'Query the E2E learning system for insights about test stability, flaky tests, selector health, page health, API health, error patterns, and trends. Builds knowledge across runs.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description: 'What to query: "summary" (full overview), "flaky" (flaky tests), "selectors" (selector stability), "pages" (page health), "apis" (API health), "errors" (error patterns), "trends" (7-day trend). Drill-down: "test:<name>", "page:<path>", "selector:<value>".',
+        },
+        days: {
+          type: 'number',
+          description: 'Analysis window in days (default: 30)',
+        },
+        cwd: {
+          type: 'string',
+          description: 'Project root directory (defaults to the current working directory).',
+        },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'e2e_neo4j',
+    description:
+      'Manage the Neo4j knowledge graph container for E2E learnings. Requires Docker.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['start', 'stop', 'status'],
+          description: 'Container lifecycle action',
+        },
+        cwd: {
+          type: 'string',
+          description: 'Absolute path to the project root directory.',
+        },
+      },
+      required: ['action'],
+    },
+  },
+  {
+    name: 'e2e_network_logs',
+    description:
+      'Query network request/response logs for a specific test run. Returns filtered logs from SQLite. Use the runDbId from e2e_run results to drill down into network details on demand.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        runDbId: {
+          type: 'number',
+          description: 'The run database ID (returned by e2e_run in the summary)',
+        },
+        testName: {
+          type: 'string',
+          description: 'Filter by test name',
+        },
+        method: {
+          type: 'string',
+          description: 'Filter by HTTP method (GET, POST, etc.)',
+        },
+        statusMin: {
+          type: 'number',
+          description: 'Minimum HTTP status code (e.g. 400 for errors only)',
+        },
+        statusMax: {
+          type: 'number',
+          description: 'Maximum HTTP status code',
+        },
+        urlPattern: {
+          type: 'string',
+          description: 'Regex pattern to match against request URLs',
+        },
+        errorsOnly: {
+          type: 'boolean',
+          description: 'Only return requests with status >= 400',
+        },
+        includeHeaders: {
+          type: 'boolean',
+          description: 'Include request/response headers (default: false)',
+        },
+        includeBodies: {
+          type: 'boolean',
+          description: 'Include request/response bodies (default: false, implies includeHeaders)',
+        },
+      },
+      required: ['runDbId'],
+    },
+  },
+  {
+    name: 'e2e_vars',
+    description:
+      'Manage project variables stored in SQLite. Variables can be referenced in test JSON as {{var.KEY}}. Supports project-wide and per-suite scoping.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['set', 'get', 'list', 'delete'],
+          description: 'Action to perform: set (upsert), get (one key), list (all), delete',
+        },
+        key: {
+          type: 'string',
+          description: 'Variable name (required for set, get, delete)',
+        },
+        value: {
+          type: 'string',
+          description: 'Variable value (required for set)',
+        },
+        scope: {
+          type: 'string',
+          description: 'Scope: "project" (default) or a suite name for suite-specific override',
+        },
+        cwd: {
+          type: 'string',
+          description: 'Absolute path to the project root directory.',
+        },
+      },
+      required: ['action'],
+    },
+  },
+];
+
+/** Tools exposed on the dashboard — excludes dashboard start/stop/restart (already running). */
+export const DASHBOARD_TOOLS = TOOLS.filter(
+  t => t.name !== 'e2e_dashboard_start' && t.name !== 'e2e_dashboard_stop' && t.name !== 'e2e_dashboard_restart'
+);
+
+// ── Dashboard broadcast helper ────────────────────────────────────────────────
+
+function createDashboardBroadcaster(dashboardPort) {
+  const broadcaster = function broadcast(data) {
+    const body = JSON.stringify(data);
+    broadcaster._last = new Promise((resolve) => {
+      const req = http.request({
+        hostname: '127.0.0.1',
+        port: dashboardPort,
+        path: '/api/broadcast',
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+        timeout: 1000,
+      });
+      req.on('error', () => resolve());
+      req.on('close', () => resolve());
+      req.end(body);
+    });
+  };
+  broadcaster._last = null;
+  broadcaster.flush = () => broadcaster._last || Promise.resolve();
+  return broadcaster;
+}
+
+async function detectDashboardPort() {
+  for (const port of [8484]) {
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/api/status`);
+      if (res.ok) return port;
+    } catch { /* not running */ }
+  }
+  return null;
+}
+
+// ── Tool handlers ─────────────────────────────────────────────────────────────
+
+async function handleRun(args) {
+  const configOverrides = {};
+  if (args.concurrency) configOverrides.concurrency = args.concurrency;
+  if (args.baseUrl) configOverrides.baseUrl = args.baseUrl;
+  if (args.retries !== undefined) configOverrides.retries = args.retries;
+  if (args.failOnNetworkError !== undefined) configOverrides.failOnNetworkError = args.failOnNetworkError;
+  if (args.verificationStrictness) configOverrides.verificationStrictness = args.verificationStrictness;
+
+  const config = await loadConfig(configOverrides, args.cwd);
+  config.triggeredBy = 'mcp';
+
+  const driverOpts = { poolDriver: config.poolDriver, maxSessions: config.maxSessions };
+  await waitForAnyPool(getPoolUrls(config), 30000, driverOpts);
+
+  let tests, hooks;
+
+  if (args.all) {
+    ({ tests, hooks } = loadAllSuites(config.testsDir, config.modulesDir, config.exclude));
+  } else if (args.suite) {
+    ({ tests, hooks } = loadTestSuite(args.suite, config.testsDir, config.modulesDir));
+  } else if (args.file) {
+    const cwd = args.cwd || process.cwd();
+    const filePath = path.isAbsolute(args.file) ? args.file : path.resolve(cwd, args.file);
+    ({ tests, hooks } = loadTestFile(filePath, config.modulesDir));
+  } else {
+    return errorResult('Provide one of: all (true), suite (name), or file (path)');
+  }
+
+  if (tests.length === 0) {
+    return errorResult('No tests found');
+  }
+
+  // Wire up live progress to dashboard if it's running
+  const dashboardPort = await detectDashboardPort();
+  if (dashboardPort) {
+    config.onProgress = createDashboardBroadcaster(dashboardPort);
+  }
+
+  const results = await runTestsParallel(tests, config, hooks || {});
+
+  // Flush the run:complete broadcast before building the response
+  if (config.onProgress?.flush) await config.onProgress.flush();
+
+  const report = generateReport(results);
+  saveReport(report, config.screenshotsDir, config);
+  // Derive suite name: explicit suite > file basename > null (for "all")
+  let suiteName = args.suite || null;
+  if (!suiteName && args.file) {
+    suiteName = path.basename(args.file, '.json');
+  }
+  const { runDbId } = await persistRun(report, config, suiteName);
+
+  const failures = report.results
+    .filter(r => !r.success)
+    .map(r => ({
+      name: r.name,
+      error: r.error,
+      errorScreenshot: r.errorScreenshot || null,
+    }));
+
+  const flaky = report.results
+    .filter(r => r.success && (r.attempt > 1 || r.flaky))
+    .map(r => {
+      const entry = { name: r.name };
+      if (r.voting) entry.voting = r.voting;
+      else entry.attempts = r.attempt;
+      return entry;
+    });
+
+  const summary = {
+    ...report.summary,
+    reportPath: path.join(config.screenshotsDir, 'report.json'),
+  };
+  if (runDbId) summary.runDbId = runDbId;
+
+  const consoleErrors = report.results
+    .filter(r => r.consoleLogs?.some(l => l.type === 'error' || l.type === 'warning'))
+    .map(r => ({ name: r.name, logs: r.consoleLogs.filter(l => l.type === 'error' || l.type === 'warning') }));
+  const networkErrors = report.results
+    .filter(r => r.networkErrors?.length > 0)
+    .map(r => ({ name: r.name, errors: r.networkErrors }));
+
+  // Compact network summary — full logs available on-demand via e2e_network_logs
+  const networkSummary = report.results
+    .filter(r => r.networkLogs?.length > 0)
+    .map(r => {
+      const logs = r.networkLogs;
+      const statusDist = { '2xx': 0, '3xx': 0, '4xx': 0, '5xx': 0, other: 0 };
+      let totalDuration = 0;
+      for (const l of logs) {
+        const s = l.status;
+        if (s >= 200 && s < 300) statusDist['2xx']++;
+        else if (s >= 300 && s < 400) statusDist['3xx']++;
+        else if (s >= 400 && s < 500) statusDist['4xx']++;
+        else if (s >= 500 && s < 600) statusDist['5xx']++;
+        else statusDist.other++;
+        totalDuration += l.duration || 0;
+      }
+      const failed = logs.filter(l => l.status >= 400).map(l => ({ url: l.url, method: l.method, status: l.status }));
+      const slowest = [...logs].sort((a, b) => (b.duration || 0) - (a.duration || 0)).slice(0, 3).map(l => ({ url: l.url, method: l.method, status: l.status, duration: l.duration }));
+      return {
+        name: r.name,
+        totalRequests: logs.length,
+        statusDistribution: statusDist,
+        avgDurationMs: logs.length > 0 ? Math.round(totalDuration / logs.length) : 0,
+        failedRequests: failed,
+        slowestRequests: slowest,
+      };
+    });
+
+  const verifications = report.results
+    .filter(r => r.expect && r.verificationScreenshot)
+    .map(r => {
+      const entry = {
+        name: r.name,
+        expect: r.expect,
+        success: r.success,
+        screenshotHash: 'ss:' + computeScreenshotHash(r.verificationScreenshot),
+      };
+      if (r.baselineScreenshot) {
+        entry.baselineScreenshotHash = 'ss:' + computeScreenshotHash(r.baselineScreenshot);
+      }
+      if (Array.isArray(r.expect)) {
+        entry.isChecklist = true;
+      }
+      return entry;
+    });
+
+  if (flaky.length > 0) summary.flaky = flaky;
+  if (failures.length > 0) summary.failures = failures;
+  if (consoleErrors.length > 0) summary.consoleErrors = consoleErrors;
+  if (networkErrors.length > 0) {
+    summary.networkErrors = networkErrors;
+    // Warn when tests pass but have network errors and failOnNetworkError is off
+    if (!config.failOnNetworkError) {
+      const totalNetErrors = networkErrors.reduce((sum, r) => sum + r.errors.length, 0);
+      const passingWithErrors = networkErrors.filter(r => report.results.find(rr => rr.name === r.name)?.success).length;
+      if (passingWithErrors > 0) {
+        summary.networkWarning = `⚠️ ${passingWithErrors} test(s) PASSED but had ${totalNetErrors} network error(s). Set failOnNetworkError: true to fail these tests.`;
+      }
+    }
+  }
+  if (networkSummary.length > 0) {
+    summary.networkSummary = networkSummary;
+    if (runDbId) summary.networkLogsHint = 'Full network logs available via e2e_network_logs tool using the runDbId above.';
+  }
+  if (verifications.length > 0) {
+    summary.verifications = verifications;
+    const hasBaselines = verifications.some(v => v.baselineScreenshotHash);
+    const hasChecklists = verifications.some(v => v.isChecklist);
+    summary.verificationInstructions = buildVerificationInstructions(config.verificationStrictness || 'moderate', hasBaselines, hasChecklists);
+  }
+
+  // Build per-test narrative: a step-by-step human-readable story of what happened
+  const narratives = report.results.map(r => ({
+    name: r.name,
+    status: r.success ? 'PASSED' : 'FAILED',
+    steps: narrateTest(r),
+  }));
+  if (narratives.length > 0) summary.narratives = narratives;
+
+  // Enrich with learning insights + health snapshot (fire-and-forget — never fails the response)
+  if (config.learningsEnabled !== false) {
+    try {
+      const projectId = ensureProject(config._cwd, config.projectName, config.screenshotsDir, config.testsDir);
+
+      // Always include health snapshot (~200 bytes) for project context
+      const health = getHealthSnapshot(projectId);
+      if (health) {
+        summary.healthSnapshot = health;
+        summary.learningsHint = "Use e2e_learnings tool with query 'summary' for full analysis.";
+      }
+
+      // Contextual insights for this specific run
+      const insights = getRunInsights(projectId, report);
+      if (insights.length > 0) {
+        summary.learnings = {
+          insights,
+          tip: insights.find(i => i.type === 'new-failure')
+            ? 'New test failure detected — this test was previously stable. Check recent code changes.'
+            : insights.find(i => i.type === 'unstable-selectors')
+            ? 'Unstable selectors detected in this run. Consider using more specific selectors or data-testid attributes.'
+            : insights.find(i => i.type === 'flaky')
+            ? 'Known flaky tests in this run. Consider increasing timeouts or adding waits.'
+            : null,
+        };
+      }
+
+      // Actionable improvements from cross-referencing this run with historical data
+      const improvements = generateImprovements(projectId, report);
+      if (improvements.length > 0) {
+        summary.improvements = improvements;
+      }
+    } catch { /* never fail the run response */ }
+  }
+
+  // Hindsight hints — LLM-powered fix suggestions for failures (async, never blocks)
+  if (hasApiKey(config) && failures.length > 0) {
+    try {
+      const maxHints = config.hintsMaxFailures ?? 3;
+      const hintTargets = failures.slice(0, maxHints);
+      const failedResults = hintTargets.map(f => report.results.find(r => r.name === f.name)).filter(Boolean);
+      const hints = (await Promise.all(failedResults.map(r => generateHindsightHint(r, config)))).filter(Boolean);
+      if (hints.length > 0) {
+        summary.hindsightHints = hints;
+      }
+    } catch { /* never fail the run response */ }
+  }
+
+  return textResult(JSON.stringify(summary, null, 2));
+}
+
+async function handleList(args) {
+  const config = await loadConfig({}, args.cwd);
+  const suites = listSuites(config.testsDir);
+
+  const lines = [];
+
+  if (suites.length === 0) {
+    lines.push('No test suites found in ' + config.testsDir);
+  } else {
+    lines.push(...suites.map(s =>
+      `${s.name} (${s.testCount} tests): ${s.tests.join(', ')}`
+    ));
+  }
+
+  // List available modules
+  const modules = listModules(config.modulesDir);
+  if (modules.length > 0) {
+    lines.push('');
+    lines.push('Available modules:');
+    for (const mod of modules) {
+      const paramNames = mod.params.map(p => p.required ? p.name : `${p.name}?`).join(', ');
+      lines.push(`  ${mod.name} (${paramNames}) — ${mod.description || mod.file}`);
+    }
+  }
+
+  return textResult(lines.join('\n'));
+}
+
+async function handleCreateTest(args) {
+  const config = await loadConfig({}, args.cwd);
+
+  if (!fs.existsSync(config.testsDir)) {
+    fs.mkdirSync(config.testsDir, { recursive: true });
+  }
+
+  const safeName = path.basename(args.name);
+
+  // Reject generic/ambiguous suite names
+  const baseName = safeName.replace(/\.json$/, '').replace(/^\d+-/, '');
+  const FORBIDDEN_NAMES = ['all', 'test', 'tests', 'debug', 'new', 'temp', 'tmp', 'main', 'suite', 'run', 'e2e', 'default', 'untitled'];
+  if (FORBIDDEN_NAMES.includes(baseName.toLowerCase())) {
+    return errorResult(`Suite name "${baseName}" is too generic. Use a descriptive name specific to the feature or issue being tested (e.g. "login-valid-credentials", "issue-1743-auth-redirect").`);
+  }
+
+  const filename = safeName.endsWith('.json') ? safeName : `${safeName}.json`;
+  const filePath = path.join(config.testsDir, filename);
+
+  if (fs.existsSync(filePath)) {
+    return errorResult(`File already exists: ${filePath}`);
+  }
+
+  let content;
+  if (args.hooks && Object.values(args.hooks).some(h => h?.length > 0)) {
+    content = { hooks: args.hooks, tests: args.tests };
+  } else {
+    content = args.tests;
+  }
+
+  fs.writeFileSync(filePath, JSON.stringify(content, null, 2) + '\n');
+
+  // ── Collect all actions (tests + hooks) for analysis ──
+  const allActions = [];
+  for (const test of args.tests) {
+    if (test.actions) allActions.push(...test.actions);
+  }
+  if (args.hooks) {
+    for (const hookActions of Object.values(args.hooks)) {
+      if (Array.isArray(hookActions)) allActions.push(...hookActions);
+    }
+  }
+
+  const warnings = [];
+
+  // ── Warn about beforeAll pitfall ──
+  const beforeAll = args.hooks?.beforeAll;
+  if (beforeAll?.length) {
+    const stateActions = beforeAll.filter(a =>
+      ['evaluate', 'goto', 'navigate', 'clear_cookies', 'type', 'click', 'select'].includes(a.type)
+    );
+    if (stateActions.length > 0) {
+      warnings.push('⚠️ beforeAll runs on a separate browser page that is closed before tests start. ' +
+        'Actions that set browser state (evaluate, goto, cookies, etc.) will NOT carry over. ' +
+        'Use beforeEach instead if tests need this setup.');
+    }
+  }
+
+  // ── Detect evaluate blocks that could use built-in actions ──
+  const suggestions = analyzeEvaluateUsage(allActions);
+  if (suggestions.length > 0) {
+    warnings.push(`💡 ${suggestions.length} evaluate action(s) could potentially use built-in actions instead:\n` +
+      suggestions.map(s => `   • ${s}`).join('\n'));
+  }
+
+  // ── Detect suite-level issues: fixed waits, cross-test dependencies ──
+  const actionWarnings = analyzeActionPatterns(args.tests);
+  if (actionWarnings.length > 0) {
+    warnings.push(...actionWarnings);
+  }
+
+  // ── List available modules ──
+  let modulesInfo = '';
+  try {
+    const modules = listModules(config.modulesDir);
+    if (modules.length > 0) {
+      modulesInfo = '\n\n📦 Available modules: ' + modules.map(m => {
+        const params = m.params.filter(p => p.required).map(p => p.name);
+        return m.name + (params.length ? `(${params.join(', ')})` : '');
+      }).join(', ');
+    }
+  } catch { /* modules dir may not exist */ }
+
+  // ── #2/#3: nudge module reuse and flag extractable duplication ──
+  try {
+    const fullModules = [...loadModuleRegistry(config.modulesDir).values()];
+
+    // #2 — submitted actions already match an existing module verbatim
+    const matches = detectModuleMatches(args.tests, fullModules);
+    for (const h of matches) {
+      const req = h.params ? Object.entries(h.params).filter(([, d]) => d?.required).map(([n]) => n) : [];
+      const paramHint = req.length ? `, "params": { ${req.map(n => `"${n}": ...`).join(', ')} }` : '';
+      warnings.push(`♻️ Test "${h.test}" repeats the ${h.len} actions of existing module "${h.module}" inline. ` +
+        `Replace them with { "$use": "${h.module}"${paramHint} }.`);
+    }
+
+    // #3 — action sequences duplicated across tests that aren't a module yet
+    const matchedTests = new Set(matches.map(m => m.test));
+    const testsActions = args.tests
+      .filter(t => t.actions && !t.actions.some(a => a && a.$use) && !matchedTests.has(t.name))
+      .map(t => ({ name: t.name, sigs: actionsSigList(t.actions) }));
+
+    // include existing test files (excluding the one just written) for cross-file duplication
+    try {
+      if (fs.existsSync(config.testsDir)) {
+        for (const f of fs.readdirSync(config.testsDir).filter(x => x.endsWith('.json'))) {
+          const fp = path.join(config.testsDir, f);
+          if (fp === filePath) continue;
+          let parsed;
+          try { parsed = JSON.parse(fs.readFileSync(fp, 'utf-8')); } catch { continue; }
+          const list = Array.isArray(parsed) ? parsed : (parsed.tests || []);
+          for (const t of list) {
+            if (t && t.actions && !t.actions.some(a => a && a.$use)) {
+              testsActions.push({ name: `${f}:${t.name}`, sigs: actionsSigList(t.actions) });
+            }
+          }
+        }
+      }
+    } catch { /* ignore unreadable test files */ }
+
+    // windows already covered by an existing module → don't re-suggest extracting them
+    const moduleWindowSet = new Set();
+    for (const m of fullModules) {
+      const sigs = actionsSigList((m.actions || []).filter(a => a && !a.$use));
+      for (const w of sigWindows(sigs, 2, 6)) moduleWindowSet.add(w);
+    }
+
+    const extractable = detectExtractableSequences(testsActions, moduleWindowSet);
+    for (const e of extractable) {
+      const sample = e.tests.slice(0, 3).join(', ') + (e.tests.length > 3 ? '…' : '');
+      warnings.push(`🧩 A sequence of ${e.len} actions appears in ${e.count} tests (${sample}) but isn't a module yet. ` +
+        `Consider extracting it with e2e_create_module and referencing it via $use.`);
+    }
+  } catch { /* never fail test creation */ }
+
+  // ── Verification coverage: tests whose outcome is never checked ──
+  try {
+    let registry;
+    try { registry = loadModuleRegistry(config.modulesDir); } catch { registry = new Map(); }
+    warnings.push(...detectUnverifiedTests(args.tests, registry));
+  } catch { /* never fail test creation */ }
+
+  const warningBlock = warnings.length > 0 ? '\n\n' + warnings.join('\n\n') : '';
+
+  // Enrich with learnings context for smarter test authoring
+  let learningsBlock = '';
+  try {
+    const projectId = ensureProject(config._cwd, config.projectName, config.screenshotsDir, config.testsDir);
+    const ctx = getTestCreationContext(projectId);
+    if (ctx) {
+      const lines = ['\n\n⚠ LEARNINGS FROM PREVIOUS RUNS:'];
+
+      if (ctx.unstableSelectors?.length) {
+        lines.push('  Unstable selectors (avoid these):');
+        for (const s of ctx.unstableSelectors) {
+          lines.push(`    - ${s.selector} (${s.failRate}% fail rate) → ${s.suggestion}`);
+        }
+      }
+
+      if (ctx.errorPatterns?.length) {
+        lines.push('  Common errors:');
+        for (const e of ctx.errorPatterns) {
+          lines.push(`    - ${e.category || 'unknown'} (${e.count}x) — ${e.pattern}`);
+        }
+      }
+
+      if (ctx.slowPages?.length) {
+        lines.push('  Slow pages (add extra waits):');
+        for (const p of ctx.slowPages) {
+          lines.push(`    - ${p.page} (avg ${(p.avgLoadMs / 1000).toFixed(1)}s load)`);
+        }
+      }
+
+      if (ctx.stableSelectors?.length) {
+        lines.push('  Reliable selectors (safe to use):');
+        for (const s of ctx.stableSelectors) {
+          lines.push(`    - ${s.selector} (100% success, ${s.uses} uses)`);
+        }
+      }
+
+      if (ctx.flakyTests?.length) {
+        lines.push('  Flaky tests (consider retries):');
+        for (const f of ctx.flakyTests) {
+          lines.push(`    - ${f.name} (${f.flakyCount} flaky runs out of ${f.totalRuns})`);
+        }
+      }
+
+      if (ctx.apiIssues?.length) {
+        lines.push('  Unreliable API endpoints:');
+        for (const a of ctx.apiIssues) {
+          lines.push(`    - ${a.endpoint} (${a.errorRate}% error rate)`);
+        }
+      }
+
+      if (ctx.passRate !== undefined) {
+        lines.push(`  Overall project pass rate: ${ctx.passRate}%`);
+      }
+
+      learningsBlock = lines.join('\n');
+    }
+  } catch { /* never fail test creation */ }
+
+  return textResult(`Created test file: ${filePath}\n\n${args.tests.length} test(s) defined.${warningBlock}${modulesInfo}${learningsBlock}`);
+}
+
+/**
+ * Analyze evaluate actions and suggest built-in replacements.
+ * Returns an array of human-readable suggestion strings.
+ */
+function analyzeEvaluateUsage(actions) {
+  const suggestions = [];
+
+  for (const action of actions) {
+    if (action.type !== 'evaluate' || !action.value) continue;
+    const code = action.value;
+
+    // Pattern: clicking elements by text — .click() after finding by textContent
+    if (/\.textContent[^]*\.click\(\)/s.test(code) || /\.find\([^)]*textContent[^)]*\)[^]*\.click/s.test(code)) {
+      if (/tab/i.test(code)) {
+        suggestions.push('Tab click via evaluate → use { type: "click", text: "Tab Name" } (click searches [role="tab"] natively)');
+      } else if (/menu/i.test(code)) {
+        suggestions.push('Menu item click via evaluate → use { type: "click_menu_item", text: "Item Name" }');
+      } else {
+        suggestions.push('Element click via evaluate → use { type: "click", text: "..." } or click_regex/click_in_context');
+      }
+    }
+
+    // Pattern: body.innerText.includes() for text presence
+    if (/document\.body\.innerText[^]*\.includes\(/s.test(code) || /body\.includes\(/s.test(code)) {
+      // Detect negation patterns (!includes) that should use assert_no_text
+      const hasNegation = /!\s*body\.includes\(|!\s*\w+\.includes\(|!body\.includes\(/s.test(code)
+        || /=\s*!.*\.includes\(/s.test(code);
+      const includeCount = (code.match(/\.includes\(/g) || []).length;
+
+      if (hasNegation) {
+        suggestions.push(`🚨 Text negation check (!includes) → use { type: "assert_no_text", text: "..." } for absent text, and { type: "assert_text", text: "..." } for present text`);
+      } else if (includeCount <= 3) {
+        suggestions.push(`Text presence check (${includeCount} includes) → use ${includeCount}x { type: "assert_text", text: "..." }`);
+      } else {
+        suggestions.push(`Text presence check (${includeCount} includes) → use assert_text for each, or assert_text_in with regex: { type: "assert_text_in", selector: "body", text: "word1|word2" }`);
+      }
+    }
+
+    // Pattern: querySelectorAll(...).length checks
+    if (/querySelectorAll\([^)]+\)\.length/s.test(code) && !/getComputedStyle/.test(code)) {
+      suggestions.push('Element counting via evaluate → use { type: "assert_count", selector: "...", value: ">= N" }');
+    }
+
+    // Pattern: checking element visibility/existence without computed styles
+    if (/querySelector\([^)]+\)\s*;?\s*(if\s*\(!\s*\w+\)|===?\s*null)/s.test(code) && !/getComputedStyle/.test(code)) {
+      suggestions.push('Element existence check via evaluate → use { type: "assert_visible", selector: "..." }');
+    }
+
+    // Pattern: return JSON.stringify for debug info (no throw/Error)
+    if (/return\s+JSON\.stringify/s.test(code) && !/throw\s+new\s+Error/s.test(code) && !/FAIL/s.test(code)) {
+      suggestions.push('Informational evaluate (returns JSON, never throws) → remove or replace with specific assertions');
+    }
+
+    // Pattern: setTimeout polling loop
+    if (/setTimeout|setInterval/s.test(code) && /while|Date\.now/s.test(code)) {
+      suggestions.push('Polling loop in evaluate → use { type: "wait", text: "..." } or { type: "wait", selector: "..." } with timeout');
+    }
+
+    // Pattern: return static string with no checks
+    if (/^\(\(\)\s*=>\s*\{\s*return\s+['"`][^]*['"`];\s*\}\)\(\)$/.test(code.trim())) {
+      suggestions.push('No-op evaluate (returns static string) → remove entirely');
+    }
+
+    // 🚨 Pattern: evaluate that NEVER fails — no throw, no FAIL:/ERROR:, no return false
+    const canFail = /throw\s+new\s+Error/s.test(code) || /\bFAIL[:\s]/s.test(code) || /\bERROR[:\s]/s.test(code)
+      || /return\s+false\b/s.test(code) || /return\s+'FAIL/s.test(code) || /return\s+`FAIL/s.test(code);
+
+    if (!canFail) {
+      // Any template string return → always truthy, test always passes
+      if (/return\s+`[^`]*\$\{[^}]+\}[^`]*`/s.test(code)) {
+        suggestions.push(
+          '🚨 Evaluate returns template string but NEVER throws or returns false — ' +
+          'this action will ALWAYS PASS regardless of results. Either throw new Error("FAIL: ...") when conditions fail, or use built-in assert actions'
+        );
+      }
+      // Returns a plain string (not template) that isn't FAIL/ERROR
+      else if (/return\s+['"][^'"]*['"]/s.test(code) && code.length > 60) {
+        suggestions.push(
+          '⚠️ Evaluate returns a plain string but never fails — informational-only. Add failure conditions or replace with assert actions'
+        );
+      }
+    }
+
+    // 🚨 Pattern: .click() inside evaluate — should use built-in click action
+    if (/\.click\(\)/s.test(code) && !(/\.textContent[^]*\.click\(\)/s.test(code))) {
+      // Only flag if not already caught by the textContent click pattern above
+      if (/\.filter\([^)]*text/s.test(code) || /querySelectorAll[^)]*\)[^]*\.click/s.test(code) || /querySelector[^)]*\)[^]*\.click/s.test(code)) {
+        suggestions.push(
+          '🚨 Element click via evaluate → use { type: "click", text: "..." } or { type: "click", selector: "..." }. ' +
+          'Built-in click has retries, waits, and better error reporting'
+        );
+      }
+    }
+
+    // 🚨 Pattern: MUI/framework selectors inside evaluate — fragile
+    const muiMatches = code.match(/\.Mui[\w-]+/g) || [];
+    if (muiMatches.length > 0) {
+      suggestions.push(
+        `⚠️ MUI class selectors (${muiMatches.slice(0, 3).join(', ')}) are auto-generated and change between versions. ` +
+        `Prefer [data-testid="..."], [role="..."], or text-based selectors`
+      );
+    }
+
+    // 🚨 Pattern: sets window.__e2e_* globals for cross-test state sharing
+    if (/window\.__e2e_\w+\s*=/.test(code) && !/window\.__e2e\./.test(code.replace(/window\.__e2e_\w+\s*=/g, ''))) {
+      suggestions.push(
+        '⚠️ Cross-test state via window.__e2e_* — if test retries are enabled, retried tests get a fresh page and lose this state. ' +
+        'Make each test self-contained by re-querying data, or disable retries for this suite'
+      );
+    }
+  }
+
+  return suggestions;
+}
+
+/**
+ * Analyze all actions in a suite for non-evaluate issues:
+ * fixed numeric waits, cross-test dependencies, etc.
+ */
+function analyzeActionPatterns(tests) {
+  const warnings = [];
+
+  // Detect fixed numeric waits (could be text/selector-based)
+  for (const test of tests) {
+    if (!test.actions) continue;
+    for (const action of test.actions) {
+      if (action.type === 'wait' && /^\d+$/.test(String(action.value))) {
+        const ms = parseInt(action.value, 10);
+        if (ms >= 3000) {
+          warnings.push(
+            `⏱️ Fixed ${ms}ms wait in "${test.name}" — prefer { type: "wait", text: "..." } or { type: "wait", selector: "..." } ` +
+            `which retries until the condition is met. Fixed waits are either too short (flaky) or too long (slow).`
+          );
+          break; // one warning per test is enough
+        }
+      }
+    }
+  }
+
+  // Detect MUI/framework selectors in action selectors
+  for (const test of tests) {
+    if (!test.actions) continue;
+    for (const action of test.actions) {
+      const sel = action.selector || '';
+      if (/\.Mui[\w-]+/.test(sel) || /\.ant-[\w-]+/.test(sel) || /\.v-[\w-]+/.test(sel)) {
+        const match = sel.match(/\.(Mui[\w-]+|ant-[\w-]+|v-[\w-]+)/);
+        warnings.push(
+          `⚠️ Framework selector ".${match[1]}" in "${test.name}" (${action.type}) — ` +
+          `these class names are auto-generated and break on version upgrades. ` +
+          `Prefer [data-testid="..."], [role="..."], or text-based actions`
+        );
+        break;
+      }
+    }
+  }
+
+  // Detect cross-test state: test N writes window.__e2e_*, test M reads it
+  const writers = new Map(); // varName → test name
+  const readers = new Map(); // varName → [test names]
+  for (const test of tests) {
+    if (!test.actions) continue;
+    for (const action of test.actions) {
+      if (action.type !== 'evaluate' || !action.value) continue;
+      const code = action.value;
+      // Find writes: window.__e2e_foo = ...
+      const writeMatches = code.matchAll(/window\.(__e2e_\w+)\s*=/g);
+      for (const m of writeMatches) {
+        if (!writers.has(m[1])) writers.set(m[1], test.name);
+      }
+      // Find reads: window.__e2e_foo (not followed by =)
+      const readMatches = code.matchAll(/window\.(__e2e_\w+)(?!\s*=)/g);
+      for (const m of readMatches) {
+        if (!readers.has(m[1])) readers.set(m[1], []);
+        if (!readers.get(m[1]).includes(test.name)) readers.get(m[1]).push(test.name);
+      }
+    }
+  }
+
+  for (const [varName, writerTest] of writers) {
+    const readerTests = (readers.get(varName) || []).filter(t => t !== writerTest);
+    if (readerTests.length > 0) {
+      warnings.push(
+        `🔗 Cross-test dependency: "${writerTest}" sets ${varName}, read by: ${readerTests.map(t => `"${t}"`).join(', ')}. ` +
+        `If "${writerTest}" fails, dependent tests will cascade-fail with confusing errors. ` +
+        `Consider re-querying data in each test or combining them into a single test.`
+      );
+    }
+  }
+
+  return warnings;
+}
+
+// ── Module-reuse detection (#2 exact match, #3 extractable duplication) ──
+
+// Normalized signature of an action for sequence comparison.
+function actionSig(a) {
+  if (!a || typeof a !== 'object') return '∅';
+  if (a.$use) return `$use:${a.$use}`;
+  return `${a.type || '?'}|${a.selector || ''}|${a.text || ''}`;
+}
+function actionsSigList(actions) {
+  return (actions || []).map(actionSig);
+}
+// All contiguous sig windows of length minLen..maxLen, each joined with '»'.
+function sigWindows(sigs, minLen, maxLen) {
+  const out = [];
+  const top = Math.min(maxLen, sigs.length);
+  for (let len = minLen; len <= top; len++) {
+    for (let i = 0; i + len <= sigs.length; i++) {
+      out.push(sigs.slice(i, i + len).join('»'));
+    }
+  }
+  return out;
+}
+
+// #2 — a module field matches a concrete test field; {{param}} placeholders are wildcards.
+function moduleFieldMatch(modVal, testVal) {
+  if (modVal == null || modVal === '') return true;            // module doesn't constrain it
+  if (typeof modVal === 'string' && modVal.includes('{{')) return true; // placeholder → wildcard
+  return modVal === testVal;
+}
+function moduleActionMatch(modA, testA) {
+  if (!modA || !testA || modA.$use || testA.$use) return false;
+  return modA.type === testA.type
+    && moduleFieldMatch(modA.selector, testA.selector)
+    && moduleFieldMatch(modA.text, testA.text);
+}
+// Find modules whose full leaf-action sequence appears as a contiguous run inside a test
+// that doesn't already use modules. Returns [{ module, params, test, len }].
+function detectModuleMatches(tests, fullModules) {
+  const hits = [];
+  for (const mod of fullModules) {
+    const ma = (mod.actions || []).filter(a => a && !a.$use);
+    if (ma.length < 2) continue;
+    for (const test of tests) {
+      const ta = test.actions || [];
+      if (ta.some(a => a && a.$use)) continue; // already modular
+      for (let i = 0; i + ma.length <= ta.length; i++) {
+        let ok = true;
+        for (let j = 0; j < ma.length; j++) {
+          if (!moduleActionMatch(ma[j], ta[i + j])) { ok = false; break; }
+        }
+        if (ok) { hits.push({ module: mod.$module, params: mod.params, test: test.name, len: ma.length }); break; }
+      }
+    }
+  }
+  return hits;
+}
+// #3 — contiguous sig windows (len>=minLen) shared by >=2 distinct tests and not already a module.
+function detectExtractableSequences(testsActions, moduleWindowSet, { minLen = 3, maxLen = 6, cap = 2 } = {}) {
+  const owners = new Map(); // windowKey -> Set(testName)
+  const lenOf = new Map();  // windowKey -> action count
+  for (const t of testsActions) {
+    const seen = new Set();
+    for (const key of sigWindows(t.sigs, minLen, maxLen)) {
+      if (key.includes('$use:') || moduleWindowSet.has(key) || seen.has(key)) continue;
+      seen.add(key);
+      if (!owners.has(key)) { owners.set(key, new Set()); lenOf.set(key, key.split('»').length); }
+      owners.get(key).add(t.name);
+    }
+  }
+  const cands = [];
+  for (const [key, set] of owners) {
+    if (set.size >= 2) cands.push({ key, len: lenOf.get(key), count: set.size, tests: [...set] });
+  }
+  cands.sort((a, b) => b.len - a.len || b.count - a.count); // longest, then most frequent
+  const kept = [];
+  for (const c of cands) {
+    if (kept.some(k => k.key.includes(c.key))) continue; // subsumed by a longer kept window
+    kept.push(c);
+    if (kept.length >= cap) break;
+  }
+  return kept;
+}
+
+// Verification coverage — a test whose interactions are never followed by a check
+// can go green even when the flow silently breaks.
+function isVerifyingAction(a) {
+  if (/^assert_/.test(a.type || '')) return true;
+  if (a.type === 'evaluate' || a.type === 'gql') return true; // strict semantics / inline assertions
+  if (a.type === 'wait' && (a.selector || a.text || a.gone)) return true; // condition waits fail if unmet
+  return false;
+}
+function isInteractingAction(a) {
+  return /^(click|select|type|fill|clear|press|hover|scroll|set_storage|focus_autocomplete|goto|navigate)/.test(a.type || '');
+}
+function detectUnverifiedTests(tests, registry) {
+  const out = [];
+  for (const t of tests || []) {
+    if (!t || !Array.isArray(t.actions) || t.expect) continue; // "expect" verifies the end state visually
+    // expand $use so module-provided assertions count
+    const leaf = [];
+    let resolvable = true;
+    for (const a of t.actions) {
+      if (a && a.$use) {
+        const mod = registry.get(a.$use);
+        if (mod?.actions) leaf.push(...mod.actions.filter(x => x && !x.$use));
+        else { resolvable = false; break; }
+      } else if (a) leaf.push(a);
+    }
+    if (!resolvable) continue;
+    let lastInteract = -1;
+    leaf.forEach((a, i) => { if (isInteractingAction(a)) lastInteract = i; });
+    if (lastInteract === -1) continue; // nothing happens — nothing to verify
+    if (!leaf.some(isVerifyingAction)) {
+      out.push(`🔎 Test "${t.name}" has no assertions and no "expect" field — it can pass without verifying anything. ` +
+        `Close with assert_* actions (assert_url, assert_text, assert_visible) or add an "expect" for visual verification.`);
+    } else if (!leaf.slice(lastInteract + 1).some(isVerifyingAction)) {
+      out.push(`🔎 Test "${t.name}" keeps interacting after its last check — the final steps are unverified. ` +
+        `Close with an assert_* action so the end state is what passes the test.`);
+    } else {
+      const tail = leaf.slice(lastInteract + 1).filter(isVerifyingAction);
+      if (tail.length && tail.every(a => a.type === 'assert_text')) {
+        out.push(`📌 Test "${t.name}" closes with page-wide assert_text only — it matches anywhere on the page. ` +
+          `Scope the final check with assert_element_text or assert_text_in.`);
+      }
+    }
+  }
+  return out;
+}
+
+async function handlePoolStatus(args) {
+  const config = await loadConfig({}, args.cwd);
+  const poolUrls = getPoolUrls(config);
+  const aggregated = await getAggregatedPoolStatus(poolUrls, { poolDriver: config.poolDriver, maxSessions: config.maxSessions });
+
+  const lines = [];
+
+  if (poolUrls.length > 1) {
+    lines.push(`Pools:     ${aggregated.totalPools} (${aggregated.availableCount} available)`);
+    lines.push(`Running:   ${aggregated.totalRunning}/${aggregated.totalMaxConcurrent}`);
+    lines.push(`Queued:    ${aggregated.totalQueued}`);
+    lines.push('');
+    for (const pool of aggregated.pools) {
+      const status = pool.available ? 'available' : pool.error ? `offline (${pool.error})` : 'busy';
+      lines.push(`  ${pool.url}: ${status} (${pool.running}/${pool.maxConcurrent}, ${pool.queued} queued)`);
+    }
+  } else {
+    const pool = aggregated.pools[0];
+    lines.push(`Available: ${pool.available ? 'yes' : 'no'}`);
+    lines.push(`Running:   ${pool.running}/${pool.maxConcurrent}`);
+    lines.push(`Queued:    ${pool.queued}`);
+    lines.push(`Sessions:  ${pool.sessions?.length ?? 0}`);
+    if (pool.error) {
+      lines.push(`Error:     ${pool.error}`);
+    }
+  }
+
+  return textResult(lines.join('\n'));
+}
+
+async function handleAppPoolStatus(args) {
+  const config = await loadConfig({}, args.cwd);
+  if (!isAppPoolEnabled(config)) {
+    return textResult('App pool is not enabled. Set appPool.enabled = true in e2e.config.js to use isolated app environments per test.');
+  }
+
+  const status = getAppPoolStatus();
+  const lines = [
+    `Driver:        ${config.appPool.driver}`,
+    `Active forks:  ${status.activeForks}/${config.appPool.maxForks}`,
+    `Port range:    ${config.appPool.forkBasePort}-${config.appPool.forkBasePort + config.appPool.maxForks - 1}`,
+    `Allocated:     ${status.allocatedPorts.length ? status.allocatedPorts.join(', ') : 'none'}`,
+  ];
+
+  if (status.forks.length > 0) {
+    lines.push('');
+    for (const fork of status.forks) {
+      lines.push(`  ${fork.forkId}: port ${fork.port}, ${fork.baseUrl} (${fork.testName || 'unnamed'}, ${fork.forkTimeMs}ms)`);
+    }
+  }
+
+  return textResult(lines.join('\n'));
+}
+
+async function handleScreenshot(args) {
+  if (!args.hash) return errorResult('Missing required parameter: hash');
+
+  const row = lookupScreenshotHash(args.hash);
+  if (!row) return errorResult(`Screenshot not found for hash: ${args.hash}`);
+
+  if (!fs.existsSync(row.file_path)) {
+    return errorResult(`Screenshot file no longer exists: ${row.file_path}`);
+  }
+
+  const data = fs.readFileSync(row.file_path);
+  const base64 = data.toString('base64');
+  const ext = path.extname(row.file_path).toLowerCase();
+  const mimeTypes = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp' };
+  const mimeType = mimeTypes[ext] || 'image/png';
+  const filename = path.basename(row.file_path);
+  const hash = row.hash;
+
+  // Build description with metadata if available
+  const metaParts = [`Screenshot ss:${hash} (${filename})`];
+  if (row.test_name) metaParts.push(`Test: ${row.test_name}`);
+  if (row.screenshot_type) metaParts.push(`Type: ${row.screenshot_type}`);
+  if (row.step_index != null) metaParts.push(`Step: ${row.step_index}`);
+  if (row.page_url) metaParts.push(`URL: ${row.page_url}`);
+
+  return {
+    content: [
+      { type: 'text', text: metaParts.join('\n') },
+      { type: 'image', data: base64, mimeType },
+    ],
+  };
+}
+
+async function handleIssue(args) {
+  if (!args.url) return errorResult('Missing required parameter: url');
+
+  const mode = args.mode || 'prompt';
+  const testType = args.testType || 'e2e';
+  const config = await loadConfig({}, args.cwd);
+
+  // Check provider and auth
+  let provider;
+  try {
+    provider = detectProvider(args.url);
+  } catch (err) {
+    return errorResult(err.message);
+  }
+
+  const auth = checkCliAuth(provider);
+  if (!auth.authenticated) {
+    return errorResult(auth.error);
+  }
+
+  if (mode === 'verify') {
+    if (!hasApiKey(config)) {
+      return errorResult('ANTHROPIC_API_KEY is required for verify mode. Set it as an environment variable.');
+    }
+
+    if (args.authToken) config.authToken = args.authToken;
+    if (args.authStorageKey) config.authStorageKey = args.authStorageKey;
+    config.testType = testType;
+
+    const result = await verifyIssue(args.url, config);
+    const status = result.bugConfirmed ? 'BUG CONFIRMED' : 'NOT REPRODUCIBLE';
+    const summary = {
+      status,
+      bugConfirmed: result.bugConfirmed,
+      issue: {
+        title: result.issue.title,
+        url: result.issue.url,
+        number: result.issue.number,
+        labels: result.issue.labels,
+      },
+      testResults: result.report.summary,
+      testsGenerated: result.tests.length,
+      suiteName: result.suiteName,
+    };
+
+    return textResult(JSON.stringify(summary, null, 2));
+  }
+
+  // Default: prompt mode
+  const issue = fetchIssue(args.url);
+  const promptData = buildPrompt(issue, config, testType);
+
+  return textResult(promptData.prompt);
+}
+
+async function handleCreateModule(args) {
+  const config = await loadConfig({}, args.cwd);
+
+  if (!config.modulesDir) {
+    return errorResult('modulesDir not configured');
+  }
+
+  if (!fs.existsSync(config.modulesDir)) {
+    fs.mkdirSync(config.modulesDir, { recursive: true });
+  }
+
+  const safeName = path.basename(args.name);
+  const filename = safeName.endsWith('.json') ? safeName : `${safeName}.json`;
+  const filePath = path.join(config.modulesDir, filename);
+
+  if (fs.existsSync(filePath)) {
+    return errorResult(`Module file already exists: ${filePath}`);
+  }
+
+  const module = {
+    $module: args.name,
+    description: args.description || '',
+    params: args.params || {},
+    actions: args.actions,
+  };
+
+  fs.writeFileSync(filePath, JSON.stringify(module, null, 2) + '\n');
+
+  const paramNames = Object.keys(args.params || {});
+  return textResult(`Created module: ${filePath}\n\nName: ${args.name}\nParams: ${paramNames.length ? paramNames.join(', ') : 'none'}\nActions: ${args.actions.length}\n\nUsage in tests: { "$use": "${args.name}", "params": { ... } }`);
+}
+
+/**
+ * Only http(s) targets are allowed for on-demand capture/analyze: these tools
+ * are reachable over the dashboard HTTP API, and file:// or other schemes
+ * would let a caller screenshot files from the browser host.
+ */
+function validateHttpUrl(raw) {
+  let parsed;
+  try { parsed = new URL(raw); } catch { return `Invalid url: ${raw}`; }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return `Unsupported url protocol "${parsed.protocol}" — only http:// and https:// are allowed`;
+  }
+  return null;
+}
+
+async function handleAnalyze(args) {
+  if (!args.url) return errorResult('Missing required parameter: url');
+  const urlError = validateHttpUrl(args.url);
+  if (urlError) return errorResult(urlError);
+
+  const config = await loadConfig({}, args.cwd);
+  const poolUrls = getPoolUrls(config);
+  const chosenPool = await selectPool(poolUrls, 2000, 60000, { poolDriver: config.poolDriver, maxSessions: config.maxSessions });
+
+  let browser;
+  let context;
+  try {
+    browser = await connectToPool(chosenPool, config.connectRetries, config.connectRetryDelay);
+    // Isolated context: closing it closes the tab on CDP pools, where
+    // disconnect() alone would leave it open in the remote browser.
+    context = await browser.createBrowserContext();
+    const page = await context.newPage();
+    await page.setViewport(config.viewport);
+
+    // Resolve auth token: explicit arg > config static > auto-login
+    const authToken = args.authToken || await resolveAuthToken(config);
+    if (authToken) {
+      const storageKey = args.authStorageKey || config.authStorageKey || 'accessToken';
+      const origin = new URL(args.url).origin;
+      await page.goto(origin, { waitUntil: 'domcontentloaded', timeout: 15000 });
+      await page.evaluate((key, token) => { localStorage.setItem(key, token); }, storageKey, authToken);
+    }
+
+    await smartNavigate(page, args.url, args.waitUntil);
+
+    if (args.selector) {
+      await page.waitForSelector(args.selector, { timeout: 10000 });
+    }
+
+    if (args.delay && args.delay > 0) {
+      await new Promise(r => setTimeout(r, args.delay));
+    }
+
+    // Extract page structure
+    const structure = await page.evaluate(extractPageStructure, args.scope || null, args.maxElements || 50);
+
+    if (structure.error) {
+      return errorResult(structure.error);
+    }
+
+    // Build meta
+    const title = await page.title();
+    const meta = {
+      url: args.url,
+      title,
+      viewport: config.viewport,
+      scope: args.scope || undefined,
+    };
+
+    // Build suggested tests
+    const suggestedTests = buildSuggestedTests(structure, args.url);
+
+    // Optional screenshot (default: true)
+    const includeScreenshot = args.includeScreenshot !== false;
+    let screenshotHash;
+    let screenshotBase64;
+
+    if (includeScreenshot) {
+      const filename = `analyze-${Date.now()}.png`;
+      if (!fs.existsSync(config.screenshotsDir)) {
+        fs.mkdirSync(config.screenshotsDir, { recursive: true });
+      }
+      const screenshotPath = path.join(config.screenshotsDir, filename);
+      await page.screenshot({ path: screenshotPath, fullPage: false });
+
+      const cwd = args.cwd || process.cwd();
+      const projectName = config.projectName || path.basename(cwd);
+      const projectId = ensureProject(cwd, projectName, config.screenshotsDir, config.testsDir);
+      const hash = computeScreenshotHash(screenshotPath);
+      registerScreenshotHash(hash, screenshotPath, projectId, null);
+      screenshotHash = `ss:${hash}`;
+      meta.screenshotHash = screenshotHash;
+
+      const data = fs.readFileSync(screenshotPath);
+      screenshotBase64 = data.toString('base64');
+    }
+
+    // Surface reusable modules at the decision point, so scaffolds can $use them
+    // instead of duplicating action sequences.
+    let availableModules = [];
+    try {
+      availableModules = listModules(config.modulesDir).map(m => ({
+        name: m.name,
+        params: m.params.map(p => (p.required ? p.name : `${p.name}?`)),
+        description: m.description || undefined,
+        hint: `{ "$use": "${m.name}"${m.params.some(p => p.required) ? ', "params": { ... }' : ''} }`,
+      }));
+    } catch { /* modules dir may not exist */ }
+
+    const result = { meta, ...structure, suggestedTests, availableModules };
+    const content = [{ type: 'text', text: JSON.stringify(result, null, 2) }];
+
+    if (screenshotBase64) {
+      content.push({ type: 'image', data: screenshotBase64, mimeType: 'image/png' });
+    }
+
+    return { content };
+  } finally {
+    if (context) try { await context.close(); } catch { /* */ }
+    if (browser) try { await disconnectFromPool(browser, chosenPool); } catch { /* */ }
+    releasePending(chosenPool);
+  }
+}
+
+async function handleCapture(args) {
+  if (!args.url) return errorResult('Missing required parameter: url');
+  const urlError = validateHttpUrl(args.url);
+  if (urlError) return errorResult(urlError);
+
+  const config = await loadConfig({}, args.cwd);
+  const capturePoolUrls = getPoolUrls(config);
+  const capturePool = await selectPool(capturePoolUrls, 2000, 60000, { poolDriver: config.poolDriver, maxSessions: config.maxSessions });
+
+  let browser;
+  let context;
+  try {
+    browser = await connectToPool(capturePool, config.connectRetries, config.connectRetryDelay);
+    // Isolated context: closing it closes the tab on CDP pools, where
+    // disconnect() alone would leave it open in the remote browser.
+    context = await browser.createBrowserContext();
+    const page = await context.newPage();
+    await page.setViewport(config.viewport);
+
+    // Resolve auth token: explicit arg > config static > auto-login
+    const authToken = args.authToken || await resolveAuthToken(config);
+    if (authToken) {
+      const storageKey = args.authStorageKey || config.authStorageKey || 'accessToken';
+      // Navigate to origin first so localStorage is accessible
+      const origin = new URL(args.url).origin;
+      await page.goto(origin, { waitUntil: 'domcontentloaded', timeout: 15000 });
+      await page.evaluate((key, token) => { localStorage.setItem(key, token); }, storageKey, authToken);
+    }
+
+    await smartNavigate(page, args.url, args.waitUntil);
+
+    if (args.selector) {
+      await page.waitForSelector(args.selector, { timeout: 10000 });
+    }
+
+    if (args.delay && args.delay > 0) {
+      await new Promise(r => setTimeout(r, args.delay));
+    }
+
+    // Build filename: sanitize and ensure .png
+    let filename = args.filename || `capture-${Date.now()}.png`;
+    filename = path.basename(filename);
+    if (!filename.endsWith('.png')) filename += '.png';
+
+    if (!fs.existsSync(config.screenshotsDir)) {
+      fs.mkdirSync(config.screenshotsDir, { recursive: true });
+    }
+
+    const screenshotPath = path.join(config.screenshotsDir, filename);
+    const data = await page.screenshot({ fullPage: !!args.fullPage });
+
+    // Blank frame (uniform color — page never rendered): don't save it,
+    // report what happened instead of returning a useless white PNG.
+    if (looksLikeBlankCapture(data, 'png')) {
+      return {
+        content: [
+          { type: 'text', text: `Capture skipped: ${args.url} rendered a blank (uniform-color) frame — nothing saved. The page likely failed to render (auth redirect, JS error, or slow load); try a longer delay or a selector to wait for.` },
+        ],
+      };
+    }
+    fs.writeFileSync(screenshotPath, data);
+
+    // Register hash in SQLite
+    const cwd = args.cwd || process.cwd();
+    const projectName = config.projectName || path.basename(cwd);
+    const projectId = ensureProject(cwd, projectName, config.screenshotsDir, config.testsDir);
+    const hash = computeScreenshotHash(screenshotPath);
+    registerScreenshotHash(hash, screenshotPath, projectId, null);
+
+    const base64 = data.toString('base64');
+
+    return {
+      content: [
+        { type: 'text', text: `Screenshot saved: ${screenshotPath}\nHash: ss:${hash}` },
+        { type: 'image', data: base64, mimeType: 'image/png' },
+      ],
+    };
+  } finally {
+    if (context) try { await context.close(); } catch { /* */ }
+    if (browser) try { await disconnectFromPool(browser, capturePool); } catch { /* */ }
+    releasePending(capturePool);
+  }
+}
+
+// Module-level state for stdio path only
+let dashboardHandle = null;
+
+async function handleDashboardStart(args) {
+  if (dashboardHandle) {
+    return errorResult('Dashboard is already running on port ' + dashboardHandle.port);
+  }
+  const overrides = {};
+  if (args.port) overrides.dashboardPort = args.port;
+  const config = await loadConfig(overrides, args.cwd);
+  dashboardHandle = await startDashboard(config);
+  return textResult(`Dashboard started at http://localhost:${dashboardHandle.port}`);
+}
+
+async function handleDashboardStop() {
+  if (!dashboardHandle) {
+    return errorResult('Dashboard is not running');
+  }
+  stopDashboard(dashboardHandle);
+  dashboardHandle = null;
+  return textResult('Dashboard stopped');
+}
+
+async function handleDashboardRestart(args) {
+  const port = Number(args.port || (dashboardHandle ? dashboardHandle.port : 8484));
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return errorResult(`Invalid port: ${args.port}`);
+
+  // Stop current instance if we own it
+  if (dashboardHandle) {
+    stopDashboard(dashboardHandle);
+    dashboardHandle = null;
+  }
+
+  // Kill a stale e2e-runner dashboard holding the target port (e.g. from another
+  // session). Only the LISTENING process, and only if it answers like our
+  // dashboard — `lsof -ti :PORT` alone also lists clients connected to the port
+  // (browsers, the MCP client itself) and any unrelated server.
+  try {
+    let isOurDashboard = false;
+    try {
+      const probe = await fetch(`http://127.0.0.1:${port}/api/status`, { signal: AbortSignal.timeout(2000) });
+      const body = await probe.json();
+      isOurDashboard = !!(body && body.dashboard && Array.isArray(body.poolUrls));
+    } catch { /* nothing listening, or not our dashboard */ }
+    const { execFileSync } = await import('child_process');
+    const lsof = isOurDashboard
+      ? execFileSync('lsof', ['-ti', `tcp:${port}`, '-sTCP:LISTEN'], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim()
+      : '';
+    if (lsof) {
+      for (const pid of lsof.split('\n').filter(Boolean)) {
+        try { process.kill(Number(pid), 'SIGTERM'); } catch {}
+      }
+      // Brief wait for port to free up
+      await new Promise(r => setTimeout(r, 500));
+    }
+  } catch {}
+
+  // Start fresh
+  const overrides = { dashboardPort: port };
+  const config = await loadConfig(overrides, args.cwd);
+  dashboardHandle = await startDashboard(config);
+  return textResult(`Dashboard restarted at http://localhost:${dashboardHandle.port}`);
+}
+
+async function handleNeo4j(args) {
+  if (!args.action) return errorResult('Missing required parameter: action');
+
+  const config = await loadConfig({}, args.cwd);
+
+  switch (args.action) {
+    case 'start':
+      try {
+        startNeo4j(config, args.cwd);
+        return textResult(`Neo4j started. Bolt: bolt://localhost:${config.neo4jBoltPort || 7687}, Browser: http://localhost:${config.neo4jHttpPort || 7474}`);
+      } catch (err) {
+        return errorResult(`Failed to start Neo4j: ${err.message}`);
+      }
+    case 'stop':
+      try {
+        stopNeo4j(config, args.cwd);
+        return textResult('Neo4j stopped');
+      } catch (err) {
+        return errorResult(`Failed to stop Neo4j: ${err.message}`);
+      }
+    case 'status': {
+      const status = getNeo4jStatus(config, args.cwd);
+      const lines = [
+        `Running: ${status.running ? 'yes' : 'no'}`,
+      ];
+      if (status.running) {
+        lines.push(`Bolt: bolt://localhost:${status.boltPort}`);
+        lines.push(`Browser: http://localhost:${status.httpPort}`);
+      }
+      if (status.error) lines.push(`Error: ${status.error}`);
+      return textResult(lines.join('\n'));
+    }
+    default:
+      return errorResult('Unknown action. Use: start, stop, status');
+  }
+}
+
+async function handleLearnings(args) {
+  if (!args.query) return errorResult('Missing required parameter: query');
+
+  const config = await loadConfig({}, args.cwd);
+  const days = Math.min(Math.max(parseInt(args.days || config.learningsDays || 30, 10) || 30, 1), 365);
+  const projectId = ensureProject(config._cwd, config.projectName, config.screenshotsDir, config.testsDir);
+
+  const query = args.query.trim().toLowerCase();
+
+  // Drill-down queries (enriched with graph data when Neo4j is available)
+  if (query.startsWith('test:')) {
+    const testName = args.query.slice(5).trim();
+    const history = getTestHistory(projectId, testName, days);
+    const result = { query: args.query, testName, history };
+    const graphDeps = await queryGraph(config, 'test-dependencies', { testName }).catch(() => null);
+    if (graphDeps) result.relatedTests = graphDeps;
+    return textResult(JSON.stringify(result, null, 2));
+  }
+  if (query.startsWith('page:')) {
+    const urlPath = args.query.slice(5).trim();
+    const history = getPageHistory(projectId, urlPath, days);
+    const result = { query: args.query, urlPath, history };
+    const graphImpact = await queryGraph(config, 'page-impact', { path: urlPath }).catch(() => null);
+    if (graphImpact) result.affectedTests = graphImpact;
+    return textResult(JSON.stringify(result, null, 2));
+  }
+  if (query.startsWith('selector:')) {
+    const selector = args.query.slice(9).trim();
+    const history = getSelectorHistory(projectId, selector, days);
+    const result = { query: args.query, selector, history };
+    const graphUsage = await queryGraph(config, 'selector-usage', { selector }).catch(() => null);
+    if (graphUsage) result.usage = graphUsage;
+    return textResult(JSON.stringify(result, null, 2));
+  }
+
+  // Category queries
+  switch (query) {
+    case 'summary': {
+      const summary = getLearningsSummary(projectId);
+      const trendsResult = getTestTrends(projectId, 7);
+      return textResult(JSON.stringify({ ...summary, recentTrend: trendsResult }, null, 2));
+    }
+    case 'flaky':
+      return textResult(JSON.stringify(getFlakySummary(projectId, days), null, 2));
+    case 'selectors':
+      return textResult(JSON.stringify(getSelectorStability(projectId, days), null, 2));
+    case 'pages':
+      return textResult(JSON.stringify(getPageHealth(projectId, days), null, 2));
+    case 'apis':
+      return textResult(JSON.stringify(getApiHealth(projectId, days), null, 2));
+    case 'errors':
+      return textResult(JSON.stringify(getErrorPatterns(projectId), null, 2));
+    case 'trends':
+      return textResult(JSON.stringify(getTestTrends(projectId, days), null, 2));
+    case 'actions':
+      return textResult(JSON.stringify(getActionHealthScores(projectId, days), null, 2));
+    default:
+      return errorResult(`Unknown query: "${args.query}". Use: summary, flaky, selectors, pages, apis, errors, trends, actions, test:<name>, page:<path>, selector:<value>`);
+  }
+}
+
+async function handleNetworkLogs(args) {
+  if (!args.runDbId) return errorResult('Missing required parameter: runDbId');
+
+  const filters = {};
+  if (args.testName) filters.testName = args.testName;
+  if (args.method) filters.method = args.method;
+  if (args.statusMin !== undefined) filters.statusMin = args.statusMin;
+  if (args.statusMax !== undefined) filters.statusMax = args.statusMax;
+  if (args.urlPattern) filters.urlPattern = args.urlPattern;
+  if (args.errorsOnly) filters.errorsOnly = true;
+  if (args.includeHeaders) filters.includeHeaders = true;
+  if (args.includeBodies) filters.includeBodies = true;
+
+  const results = getNetworkLogs(args.runDbId, filters);
+
+  if (results.length === 0) {
+    return textResult('No network logs found for the given filters.');
+  }
+
+  return textResult(JSON.stringify(results, null, 2));
+}
+
+async function handleVars(args) {
+  const action = args.action;
+  if (!action) return errorResult('Missing required parameter: action');
+
+  const cwd = args.cwd || process.cwd();
+  const config = await loadConfig({}, cwd);
+  const projectName = config.projectName || cwd.split('/').pop() || 'default';
+  const projectId = ensureProject(cwd, projectName, config.screenshotsDir, config.testsDir);
+  const scope = args.scope || 'project';
+
+  switch (action) {
+    case 'set': {
+      if (!args.key) return errorResult('Missing required parameter: key');
+      if (args.value === undefined) return errorResult('Missing required parameter: value');
+      setVariable(projectId, scope, args.key, args.value);
+      return textResult(`Variable set: ${args.key} (scope: ${scope})`);
+    }
+    case 'get': {
+      if (!args.key) return errorResult('Missing required parameter: key');
+      const vars = getVariables(projectId, scope);
+      if (vars[args.key] !== undefined) {
+        return textResult(JSON.stringify({ key: args.key, value: vars[args.key], scope }));
+      }
+      // Fall back to project scope if not found in specific scope
+      if (scope !== 'project') {
+        const projectVars = getVariables(projectId, 'project');
+        if (projectVars[args.key] !== undefined) {
+          return textResult(JSON.stringify({ key: args.key, value: projectVars[args.key], scope: 'project' }));
+        }
+      }
+      return errorResult(`Variable not found: ${args.key} (scope: ${scope})`);
+    }
+    case 'list': {
+      const all = listVariables(projectId);
+      if (Object.keys(all).length === 0) {
+        return textResult('No variables set for this project.');
+      }
+      return textResult(JSON.stringify(all, null, 2));
+    }
+    case 'delete': {
+      if (!args.key) return errorResult('Missing required parameter: key');
+      const deleted = deleteVariable(projectId, scope, args.key);
+      if (deleted) {
+        return textResult(`Variable deleted: ${args.key} (scope: ${scope})`);
+      }
+      return errorResult(`Variable not found: ${args.key} (scope: ${scope})`);
+    }
+    default:
+      return errorResult(`Unknown action: ${action}. Use set, get, list, or delete.`);
+  }
+}
+
+// ── Verification instructions builder ─────────────────────────────────────────
+
+function buildVerificationInstructions(strictness, hasBaselines, hasChecklists) {
+  const levels = {
+    strict: 'STRICT — No ambiguity allowed. If ANY criterion is unclear, not fully visible, or doubtful, verdict is FAIL. Err on the side of failing.',
+    moderate: 'MODERATE — Use reasonable judgment. Minor cosmetic differences are acceptable, but functional mismatches or missing elements are FAIL.',
+    lenient: 'LENIENT — Only fail on clear, obvious contradictions. Partial matches and minor discrepancies are acceptable.',
+  };
+
+  const lines = [
+    `Verification strictness: ${levels[strictness] || levels.moderate}`,
+    '',
+    'For each entry in the verifications array:',
+    '',
+    '1. RETRIEVE SCREENSHOTS',
+    '   - Call e2e_screenshot with the screenshotHash (after-state).',
+  ];
+
+  if (hasBaselines) {
+    lines.push('   - If baselineScreenshotHash is present, also call e2e_screenshot with it (before-state).');
+  }
+
+  lines.push(
+    '',
+    '2. EVALUATE',
+  );
+
+  if (hasChecklists) {
+    lines.push(
+      '   - If isChecklist is true, evaluate EACH item in the expect array independently as PASS or FAIL.',
+      '   - If isChecklist is false (or absent), evaluate the single expect description as a whole.',
+    );
+  } else {
+    lines.push('   - Compare the screenshot against the expect description.');
+  }
+
+  if (hasBaselines) {
+    lines.push(
+      '',
+      '3. COMPARE BEFORE/AFTER',
+      '   - If a baseline screenshot was retrieved, describe the state change between baseline and after screenshots.',
+      '   - Verify the state change is consistent with what the test actions intended.',
+    );
+  }
+
+  lines.push(
+    '',
+    `${hasBaselines ? '4' : '3'}. REPORT VERDICT — use this exact format for each test:`,
+    '',
+    '   TEST: <test-name>',
+    '   VERDICT: PASS | FAIL',
+  );
+
+  if (hasBaselines) {
+    lines.push('   STATE CHANGE: <one-line description of what changed from baseline to after>');
+  }
+
+  if (hasChecklists) {
+    lines.push(
+      '   CRITERIA:',
+      '     - "<criterion text>": PASS | FAIL (reason if FAIL)',
+    );
+  }
+
+  lines.push('   REASON: <brief explanation of the verdict>');
+
+  return lines.join('\n');
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+export function textResult(text) {
+  return { content: [{ type: 'text', text }] };
+}
+
+export function errorResult(message) {
+  return { content: [{ type: 'text', text: `Error: ${message}` }], isError: true };
+}
+
+// ── Dispatcher ────────────────────────────────────────────────────────────────
+
+/** Routes a tool call to its handler. Used by both stdio and HTTP transports. */
+export async function dispatchTool(name, args = {}) {
+  switch (name) {
+    case 'e2e_run':
+      return await handleRun(args);
+    case 'e2e_list':
+      return await handleList(args);
+    case 'e2e_create_test':
+      return await handleCreateTest(args);
+    case 'e2e_pool_status':
+      return await handlePoolStatus(args);
+    case 'e2e_app_pool_status':
+      return await handleAppPoolStatus(args);
+    case 'e2e_screenshot':
+      return await handleScreenshot(args);
+    case 'e2e_dashboard_start':
+      return await handleDashboardStart(args);
+    case 'e2e_dashboard_stop':
+      return await handleDashboardStop();
+    case 'e2e_dashboard_restart':
+      return await handleDashboardRestart(args);
+    case 'e2e_issue':
+      return await handleIssue(args);
+    case 'e2e_create_module':
+      return await handleCreateModule(args);
+    case 'e2e_capture':
+      return await handleCapture(args);
+    case 'e2e_analyze':
+      return await handleAnalyze(args);
+    case 'e2e_learnings':
+      return await handleLearnings(args);
+    case 'e2e_neo4j':
+      return await handleNeo4j(args);
+    case 'e2e_network_logs':
+      return await handleNetworkLogs(args);
+    case 'e2e_vars':
+      return await handleVars(args);
+    default:
+      return errorResult(`Unknown tool: ${name}`);
+  }
+}

@@ -1,0 +1,373 @@
+/**
+ * Module Resolver for E2E Runner
+ *
+ * Enables reusable action sequences via $use references.
+ * Modules are JSON files in the modules directory with a $module key.
+ *
+ * Features:
+ * - Parameter substitution: {{param}} and {{#param}}...{{/param}} conditionals
+ * - Module composition: modules can $use other modules
+ * - Cycle detection: prevents infinite recursion
+ * - Fail-fast: required params without values throw immediately
+ */
+
+import fs from 'fs';
+import path from 'path';
+import { KNOWN_ACTION_TYPES } from './actions.js';
+import { KNOWN_DRIVERS } from './pool.js';
+
+/**
+ * Loads all module definitions from a directory.
+ * @param {string} modulesDir - Absolute path to modules directory
+ * @returns {Map<string, object>} Map of module name -> definition
+ */
+export function loadModuleRegistry(modulesDir) {
+  const registry = new Map();
+
+  if (!modulesDir || !fs.existsSync(modulesDir)) {
+    return registry;
+  }
+
+  const files = fs.readdirSync(modulesDir).filter(f => f.endsWith('.json'));
+
+  for (const file of files) {
+    const filePath = path.join(modulesDir, file);
+    const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+
+    if (!data.$module) {
+      continue; // Not a module definition
+    }
+
+    if (registry.has(data.$module)) {
+      throw new Error(`Duplicate module name "${data.$module}" in ${file}`);
+    }
+
+    registry.set(data.$module, data);
+  }
+
+  return registry;
+}
+
+/**
+ * Replaces {{param}} placeholders and {{#param}}...{{/param}} conditionals in a string.
+ * @param {string} str - Template string
+ * @param {object} params - Parameter values
+ * @param {object} paramDefs - Parameter definitions from the module (for defaults)
+ * @returns {string} Resolved string
+ */
+function substituteParams(str, params, paramDefs) {
+  if (typeof str !== 'string') return str;
+
+  // Build effective params: defaults + provided
+  const effective = {};
+  if (paramDefs) {
+    for (const [key, def] of Object.entries(paramDefs)) {
+      if (def.default !== undefined) {
+        effective[key] = def.default;
+      }
+    }
+  }
+  Object.assign(effective, params);
+
+  // Process conditional blocks: {{#key}}content{{/key}}
+  let result = str.replace(/\{\{#(\w+)\}\}([\s\S]*?)\{\{\/\1\}\}/g, (_, key, content) => {
+    const val = effective[key];
+    if (val !== undefined && val !== '' && val !== null && val !== false) {
+      // Recursively substitute inside the block
+      return substituteParams(content, params, paramDefs);
+    }
+    return '';
+  });
+
+  // Process simple substitutions: {{key}}
+  result = result.replace(/\{\{(\w+)\}\}/g, (match, key) => {
+    if (key in effective) return String(effective[key]);
+    return match; // Leave unresolved (will be caught by validation)
+  });
+
+  return result;
+}
+
+/**
+ * Applies parameter substitution to all string fields of an action.
+ * @param {object} action - Action object
+ * @param {object} params - Parameter values
+ * @param {object} paramDefs - Parameter definitions
+ * @returns {object} New action with substituted values
+ */
+function substituteActionParams(action, params, paramDefs, moduleName) {
+  const result = {};
+  for (const [key, value] of Object.entries(action)) {
+    if (typeof value === 'string') {
+      result[key] = substituteParams(value, params, paramDefs);
+    } else {
+      result[key] = value;
+    }
+  }
+
+  // Check for unresolved placeholders
+  for (const [key, value] of Object.entries(result)) {
+    if (typeof value === 'string') {
+      const unresolved = value.match(/\{\{(\w+)\}\}/g);
+      if (unresolved) {
+        const paramNames = unresolved.map(m => m.slice(2, -2));
+        throw new Error(`Module "${moduleName || 'unknown'}": unresolved parameter(s) ${paramNames.join(', ')} in "${key}". Provide them via params or define defaults.`);
+      }
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Validates that all required parameters have values.
+ * @param {object} paramDefs - Parameter definitions from module
+ * @param {object} params - Provided parameter values
+ * @param {string} moduleName - Module name for error messages
+ */
+function validateParams(paramDefs, params, moduleName) {
+  if (!paramDefs) return;
+
+  for (const [key, def] of Object.entries(paramDefs)) {
+    if (def.required && !(key in params) && def.default === undefined) {
+      throw new Error(`Module "${moduleName}": missing required parameter "${key}"`);
+    }
+  }
+}
+
+/**
+ * Resolves an array of actions, expanding $use references recursively.
+ * @param {Array} actions - Array of actions (may contain $use references)
+ * @param {Map} registry - Module registry
+ * @param {object} contextParams - Parameters from parent scope
+ * @param {Set} visited - Set of module names in the current resolution chain (cycle detection)
+ * @returns {Array} Flattened array of concrete actions
+ */
+function resolveActions(actions, registry, contextParams = {}, visited = new Set()) {
+  const resolved = [];
+
+  for (const action of actions) {
+    if (action.$use) {
+      const moduleName = action.$use;
+
+      // Cycle detection
+      if (visited.has(moduleName)) {
+        throw new Error(`Circular module dependency detected: ${[...visited, moduleName].join(' -> ')}`);
+      }
+
+      const moduleDef = registry.get(moduleName);
+      if (!moduleDef) {
+        throw new Error(`Module not found: "${moduleName}". Available: ${[...registry.keys()].join(', ') || 'none'}`);
+      }
+
+      // Merge params: context params as fallback, then explicit params
+      const mergedParams = { ...contextParams, ...action.params };
+      validateParams(moduleDef.params, mergedParams, moduleName);
+
+      // Recursively resolve the module's actions
+      const newVisited = new Set(visited);
+      newVisited.add(moduleName);
+
+      const moduleActions = moduleDef.actions || [];
+      const substituted = moduleActions.map(a => {
+        if (a.$use) {
+          // Nested $use — resolve {{param}} placeholders in the nested call's
+          // params against THIS module's scope (its merged params + defaults)
+          // so a module can forward its own params/defaults to a module it
+          // $uses. Then merge over the inherited context params as fallback.
+          const nestedParams = {};
+          for (const [k, v] of Object.entries(a.params || {})) {
+            nestedParams[k] = typeof v === 'string'
+              ? substituteParams(v, mergedParams, moduleDef.params)
+              : v;
+          }
+          return { ...a, params: { ...mergedParams, ...nestedParams } };
+        }
+        return substituteActionParams(a, mergedParams, moduleDef.params, moduleName);
+      });
+
+      const expandedActions = resolveActions(substituted, registry, mergedParams, newVisited);
+      resolved.push(...expandedActions);
+    } else {
+      resolved.push(action);
+    }
+  }
+
+  return resolved;
+}
+
+/**
+ * Resolves all $use references in a test data structure.
+ * @param {object} data - { tests, hooks } as returned by normalizeTestData
+ * @param {string} modulesDir - Absolute path to modules directory
+ * @returns {object} New { tests, hooks } with all $use expanded
+ */
+export function resolveTestData(data, modulesDir) {
+  if (!modulesDir || !fs.existsSync(modulesDir)) {
+    return data; // No modules directory — pass through unchanged
+  }
+
+  return resolveTestDataWithRegistry(data, loadModuleRegistry(modulesDir));
+}
+
+/**
+ * Builds a module registry from an in-memory map ({ name: moduleJson }) or an
+ * array of module JSON objects. Used by the embed API so callers can pass
+ * modules without writing them to disk.
+ * @param {object|Array} modules
+ * @returns {Map<string, object>}
+ */
+export function buildModuleRegistry(modules) {
+  const registry = new Map();
+  if (!modules) return registry;
+  const entries = Array.isArray(modules)
+    ? modules.map(m => [m?.$module, m])
+    : Object.entries(modules).map(([name, m]) => [m?.$module || name, m]);
+  for (const [name, data] of entries) {
+    if (!name || !data || typeof data !== 'object') {
+      throw new Error(`Invalid module definition${name ? ` "${name}"` : ''}: expected an object with "actions"`);
+    }
+    if (registry.has(name)) throw new Error(`Duplicate module name "${name}"`);
+    registry.set(name, { ...data, $module: name });
+  }
+  return registry;
+}
+
+/**
+ * Resolves all $use references in a test data structure against a registry
+ * (as returned by loadModuleRegistry / buildModuleRegistry).
+ */
+export function resolveTestDataWithRegistry(data, registry) {
+  if (!registry || registry.size === 0) {
+    return data; // No modules defined — pass through
+  }
+
+  // Check if there are any $use references to resolve
+  const hasUseRef = (actions) => actions?.some(a => a.$use);
+  const hooksNeedResolving = Object.values(data.hooks || {}).some(hasUseRef);
+  const testsNeedResolving = data.tests?.some(t => hasUseRef(t.actions));
+
+  if (!hooksNeedResolving && !testsNeedResolving) {
+    return data; // No $use references — pass through
+  }
+
+  // Resolve hooks
+  const resolvedHooks = {};
+  for (const [hookName, actions] of Object.entries(data.hooks || {})) {
+    if (Array.isArray(actions)) {
+      resolvedHooks[hookName] = resolveActions(actions, registry);
+    } else {
+      resolvedHooks[hookName] = actions;
+    }
+  }
+
+  // Resolve test actions
+  const resolvedTests = (data.tests || []).map(test => {
+    if (!hasUseRef(test.actions)) return test;
+    return {
+      ...test,
+      actions: resolveActions(test.actions, registry),
+    };
+  });
+
+  return { tests: resolvedTests, hooks: resolvedHooks };
+}
+
+/**
+ * Lists available modules with their metadata.
+ * @param {string} modulesDir - Absolute path to modules directory
+ * @returns {Array<{name, description, params, file}>} Module metadata
+ */
+export function listModules(modulesDir) {
+  if (!modulesDir || !fs.existsSync(modulesDir)) {
+    return [];
+  }
+
+  const files = fs.readdirSync(modulesDir).filter(f => f.endsWith('.json'));
+  const modules = [];
+
+  for (const file of files) {
+    const filePath = path.join(modulesDir, file);
+    const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+
+    if (!data.$module) continue;
+
+    const paramList = data.params
+      ? Object.entries(data.params).map(([name, def]) => ({
+          name,
+          required: !!def.required,
+          default: def.default,
+          description: def.description,
+        }))
+      : [];
+
+    modules.push({
+      name: data.$module,
+      description: data.description || '',
+      file,
+      actionCount: (data.actions || []).length,
+      params: paramList,
+    });
+  }
+
+  return modules;
+}
+
+/**
+ * Validates that all action types in a resolved test data structure are known.
+ * Call AFTER module resolution so $use references have been expanded.
+ * @param {object} data - { tests, hooks } with resolved actions
+ * @param {string} context - File/suite name for error messages
+ * @throws {Error} if any unknown action types are found
+ */
+export function validateActionTypes(data, context) {
+  const unknown = [];
+
+  const check = (actions, location) => {
+    if (!Array.isArray(actions)) return;
+    for (const action of actions) {
+      if (action.$use) continue; // unresolved module ref — skip (shouldn't happen post-resolution)
+      if (action.type && !KNOWN_ACTION_TYPES.has(action.type)) {
+        unknown.push({ type: action.type, location });
+      }
+    }
+  };
+
+  // Check hooks
+  for (const [hookName, actions] of Object.entries(data.hooks || {})) {
+    check(actions, `hooks.${hookName}`);
+  }
+
+  // Check test actions
+  for (const test of data.tests || []) {
+    check(test.actions, `test "${test.name}"`);
+  }
+
+  if (unknown.length > 0) {
+    const details = unknown.map(u => `"${u.type}" in ${u.location}`).join(', ');
+    throw new Error(`Unknown action type(s) in ${context}: ${details}`);
+  }
+
+  // Validate per-test driver / fallbackDriver fields
+  const knownExceptAuto = [...KNOWN_DRIVERS].filter(d => d !== 'auto');
+  for (const test of data.tests || []) {
+    if (test.driver !== undefined && !knownExceptAuto.includes(test.driver)) {
+      throw new Error(
+        `Invalid driver "${test.driver}" in test "${test.name}" (${context}). ` +
+        `Allowed: ${knownExceptAuto.join(', ')}.`
+      );
+    }
+    if (test.fallbackDriver !== undefined && !knownExceptAuto.includes(test.fallbackDriver)) {
+      throw new Error(
+        `Invalid fallbackDriver "${test.fallbackDriver}" in test "${test.name}" (${context}). ` +
+        `Allowed: ${knownExceptAuto.join(', ')}.`
+      );
+    }
+    if (test.fallbackDriver !== undefined && test.driver === undefined) {
+      throw new Error(
+        `Test "${test.name}" (${context}) declares fallbackDriver without driver. ` +
+        `fallbackDriver only applies when driver is set.`
+      );
+    }
+  }
+}

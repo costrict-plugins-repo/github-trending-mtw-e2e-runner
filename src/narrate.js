@@ -1,0 +1,322 @@
+/**
+ * Action Narrator
+ *
+ * Converts raw action + result data into human-readable narrative strings.
+ * Each test step becomes a sentence describing what happened.
+ */
+
+/**
+ * Generates a human-readable narrative for a single action result.
+ *
+ * @param {object} action  — The original action (type, selector, value, text)
+ * @param {object} result  — The action result (success, duration, error, result)
+ * @returns {string} A narrative string describing what happened
+ */
+export function narrateAction(action, result) {
+  const { type, selector, value, text } = action;
+  const { success, duration, error } = result;
+  const time = duration != null ? ` (${duration}ms)` : '';
+
+  if (!success) {
+    return `FAIL: ${describeIntent(action)} — ${error}`;
+  }
+
+  switch (type) {
+    case 'goto':
+      return `Navigated to ${value}${time}`;
+
+    case 'click':
+      if (selector) return `Clicked on "${selector}"${time}`;
+      if (text) return `Clicked on element with text "${text}"${time}`;
+      return `Clicked${time}`;
+
+    case 'type':
+    case 'fill': {
+      const masked = isSensitive(selector) ? '***' : value;
+      return `Typed "${masked}" into "${selector}"${time}`;
+    }
+
+    case 'wait': {
+      const goneTarget = typeof action.gone === 'string' ? action.gone : (action.gone === true ? (selector || (text ? `text "${text}"` : null)) : null);
+      if (goneTarget) return `Waited for ${goneTarget.startsWith('text ') ? goneTarget : `"${goneTarget}"`} to disappear${time}`;
+      if (selector) return `Waited for "${selector}" to appear${time}`;
+      if (text) return `Waited for text "${text}" to appear${time}`;
+      return `Waited ${value}ms`;
+    }
+
+    case 'screenshot':
+      if (result.result?.screenshot) {
+        return `Captured screenshot: ${result.result.screenshot}`;
+      }
+      if (result.result?.skipped) {
+        const reason = result.result.skipped === 'blank-page'
+          ? 'page was blank'
+          : 'render looked blank';
+        return `Skipped screenshot (${reason})`;
+      }
+      return `Captured screenshot${value ? `: ${value}` : ''}`;
+
+    case 'assert_text':
+      return `Verified text "${text}" is present on page${time}`;
+
+    case 'assert_no_text':
+      return `Verified text "${text}" is NOT present on page${time}`;
+
+    case 'assert_text_in':
+      return `Verified "${selector}" contains text "${text}"${value === 'exact' ? ' (exact)' : ''}${time}`;
+
+    case 'assert_url':
+      return `Verified URL contains "${value}"${time}`;
+
+    case 'assert_visible':
+      return `Verified "${selector}" is visible${time}`;
+
+    case 'assert_count':
+      return `Verified "${selector}" has ${value} element(s)${time}`;
+
+    case 'assert_element_text':
+      return `Verified "${selector}" contains text "${text}"${time}`;
+
+    case 'assert_attribute':
+      return `Verified attribute on "${selector}": ${value}${time}`;
+
+    case 'assert_class':
+      return `Verified "${selector}" has class "${value}"${time}`;
+
+    case 'assert_not_visible':
+      return `Verified "${selector}" is not visible${time}`;
+
+    case 'assert_input_value':
+      return `Verified input "${selector}" has value "${value}"${time}`;
+
+    case 'assert_matches':
+      return `Verified "${selector}" matches pattern /${value}/${time}`;
+
+    case 'get_text': {
+      const extractedText = result.result?.value;
+      if (extractedText) {
+        const shortText = extractedText.length > 50 ? extractedText.slice(0, 47) + '...' : extractedText;
+        return `Read text from "${selector}": "${shortText}"${time}`;
+      }
+      return `Read text from "${selector}"${time}`;
+    }
+
+    case 'assert_no_network_errors':
+      return `Verified no network errors occurred${time}`;
+
+    case 'select':
+      return `Selected option "${value}" in "${selector}"${time}`;
+
+    case 'clear':
+      return `Cleared input "${selector}"${time}`;
+
+    case 'press':
+      return `Pressed key "${value}"${time}`;
+
+    case 'scroll':
+      if (selector) return `Scrolled to "${selector}"${time}`;
+      return `Scrolled down ${value || 300}px${time}`;
+
+    case 'hover':
+      return `Hovered over "${selector}"${time}`;
+
+    case 'clear_cookies':
+      return `Cleared cookies and storage${value ? ` for ${value}` : ''}${time}`;
+
+    case 'navigate':
+      return `Navigated (SPA) to ${value}${time}`;
+
+    case 'type_react': {
+      const masked = isSensitive(selector) ? '***' : value;
+      return `Typed "${masked}" into React input "${selector}"${time}`;
+    }
+
+    case 'click_regex':
+      if (selector) return `Clicked ${value === 'last' ? 'last ' : ''}element matching /${text}/i in "${selector}"${time}`;
+      return `Clicked ${value === 'last' ? 'last ' : ''}element matching /${text}/i${time}`;
+
+    case 'click_option':
+      return `Clicked dropdown option "${text}"${time}`;
+
+    case 'select_combobox':
+      return `Selected "${text || action.option}" from combobox${action.filter ? ` (filtered "${action.filter}")` : ''}${time}`;
+
+    case 'focus_autocomplete':
+      return `Focused autocomplete labeled "${text}"${time}`;
+
+    case 'click_chip':
+      return `Clicked chip "${text}"${time}`;
+
+    case 'set_storage': {
+      const storageType = selector === 'session' ? 'sessionStorage' : 'localStorage';
+      const eqIdx = value.indexOf('=');
+      const sKey = eqIdx === -1 ? value : value.slice(0, eqIdx);
+      const sVal = eqIdx === -1 ? '' : value.slice(eqIdx + 1);
+      const displayVal = isSensitive(sKey) ? '***' : (sVal.length > 30 ? sVal.slice(0, 27) + '...' : sVal);
+      return `Set ${storageType}.${sKey} = "${displayVal}"${time}`;
+    }
+
+    case 'assert_storage': {
+      const storageType = selector === 'session' ? 'sessionStorage' : 'localStorage';
+      const eqIdx = value.indexOf('=');
+      if (eqIdx === -1) {
+        return `Verified ${storageType} key "${value}" exists${time}`;
+      }
+      return `Verified ${storageType} key "${value.slice(0, eqIdx)}" has expected value${time}`;
+    }
+
+    case 'click_icon':
+      return `Clicked icon "${value}"${selector ? ` in "${selector}"` : ''}${time}`;
+
+    case 'click_menu_item':
+      return `Clicked menu item "${text}"${selector ? ` in "${selector}"` : ''}${time}`;
+
+    case 'click_in_context':
+      return `Clicked "${selector}" in container with text "${text}"${time}`;
+
+    case 'evaluate': {
+      const snippet = value.length > 80 ? value.slice(0, 77) + '...' : value;
+      const evalResult = result.result?.value;
+      if (evalResult !== undefined && evalResult !== null) {
+        const valStr = typeof evalResult === 'string' ? evalResult : JSON.stringify(evalResult);
+        const shortVal = valStr.length > 50 ? valStr.slice(0, 47) + '...' : valStr;
+        return `Executed JS: ${snippet} → ${shortVal}${time}`;
+      }
+      return `Executed JS: ${snippet}${time}`;
+    }
+
+    case 'assert_visual': {
+      const vr = result.result;
+      if (vr?.goldenCreated) return `Saved golden reference: ${value}${time}`;
+      const pct = vr?.diffPercentage != null ? (vr.diffPercentage * 100).toFixed(2) + '% diff' : '';
+      return `Visual comparison against "${value}": ${pct}${time}`;
+    }
+
+    case 'gql': {
+      const query = (value || '').replace(/\s+/g, ' ').trim();
+      const snippet = query.length > 60 ? query.slice(0, 57) + '...' : query;
+      return `Executed GraphQL: ${snippet}${selector ? ' (asserted response)' : ''}${time}`;
+    }
+
+    case 'wait_network_idle':
+      return `Waited for network idle (${value || 500}ms)${time}`;
+
+    case 'open_tab':
+      return `Opened new tab${text ? ` "${text}"` : ''} → ${value}${time}`;
+
+    case 'switch_tab':
+      return `Switched to tab "${value}"${time}`;
+
+    case 'close_tab':
+      return `Closed tab${value ? ` "${value}"` : ''}${time}`;
+
+    case 'assert_tab_count':
+      return `Verified ${value} tab(s) open${time}`;
+
+    case 'wait_for_tab':
+      return `Waited for new tab to open${text ? ` (labeled "${text}")` : ''}${time}`;
+
+    default:
+      return `Unknown action "${type}"${time}`;
+  }
+}
+
+/**
+ * Describes the intent of an action (used in failure messages).
+ */
+function describeIntent(action) {
+  const { type, selector, value, text } = action;
+
+  switch (type) {
+    case 'goto':       return `Navigate to ${value}`;
+    case 'click':      return selector ? `Click on "${selector}"` : `Click on text "${text}"`;
+    case 'type':
+    case 'fill':       return `Type into "${selector}"`;
+    case 'wait':
+      if (selector)    return `Wait for "${selector}"`;
+      if (text)        return `Wait for text "${text}"`;
+      return           `Wait ${value}ms`;
+    case 'screenshot': return 'Capture screenshot';
+    case 'assert_text':           return `Assert text "${text}" present`;
+    case 'assert_no_text':        return `Assert text "${text}" NOT present`;
+    case 'assert_text_in':        return `Assert "${selector}" contains "${text}"`;
+    case 'assert_url':            return `Assert URL contains "${value}"`;
+    case 'assert_visible':        return `Assert "${selector}" visible`;
+    case 'assert_count':          return `Assert "${selector}" count = ${value}`;
+    case 'assert_element_text':   return `Assert "${selector}" contains "${text}"`;
+    case 'assert_attribute':      return `Assert attribute on "${selector}": ${value}`;
+    case 'assert_class':          return `Assert "${selector}" has class "${value}"`;
+    case 'assert_not_visible':    return `Assert "${selector}" not visible`;
+    case 'assert_input_value':    return `Assert input "${selector}" value "${value}"`;
+    case 'assert_matches':        return `Assert "${selector}" matches /${value}/`;
+    case 'get_text':              return `Get text from "${selector}"`;
+    case 'assert_no_network_errors': return 'Assert no network errors';
+    case 'select':     return `Select "${value}" in "${selector}"`;
+    case 'clear':      return `Clear "${selector}"`;
+    case 'press':      return `Press key "${value}"`;
+    case 'scroll':     return selector ? `Scroll to "${selector}"` : `Scroll down`;
+    case 'hover':      return `Hover over "${selector}"`;
+    case 'clear_cookies': return 'Clear cookies and storage';
+    case 'navigate':   return `Navigate to ${value}`;
+    case 'type_react':            return `Type into React input "${selector}"`;
+    case 'click_regex':           return `Click element matching /${text}/i`;
+    case 'click_option':          return `Click option "${text}"`;
+    case 'select_combobox':       return `Select "${text || action.option}" from combobox`;
+    case 'focus_autocomplete':    return `Focus autocomplete "${text}"`;
+    case 'click_chip':            return `Click chip "${text}"`;
+    case 'set_storage':            return `Set ${selector === 'session' ? 'sessionStorage' : 'localStorage'} key "${value?.split('=')[0] || value}"`;
+    case 'assert_storage': {
+      const eqIdx = value?.indexOf('=') ?? -1;
+      return eqIdx === -1
+        ? `Assert ${selector === 'session' ? 'sessionStorage' : 'localStorage'} key "${value}" exists`
+        : `Assert ${selector === 'session' ? 'sessionStorage' : 'localStorage'} key "${value.slice(0, eqIdx)}" value`;
+    }
+    case 'click_icon':             return `Click icon "${value}"`;
+    case 'click_menu_item':        return `Click menu item "${text}"`;
+    case 'click_in_context':       return `Click "${selector}" in context of "${text}"`;
+    case 'evaluate':   return 'Execute JS';
+    case 'assert_visual':           return `Visual compare against "${value}"`;
+    case 'gql':                    return 'Execute GraphQL query';
+    case 'wait_network_idle':      return 'Wait for network idle';
+    case 'open_tab':               return `Open new tab → ${value}`;
+    case 'switch_tab':             return `Switch to tab "${value}"`;
+    case 'close_tab':              return `Close tab${value ? ` "${value}"` : ''}`;
+    case 'assert_tab_count':       return `Assert ${value} tab(s) open`;
+    case 'wait_for_tab':           return 'Wait for new tab';
+    default:           return `Action "${type}"`;
+  }
+}
+
+/**
+ * Checks if a selector likely refers to a sensitive field (password, token, etc.)
+ */
+function isSensitive(selector) {
+  if (!selector) return false;
+  return /password|secret|token|pin|ssn|cvv/i.test(selector);
+}
+
+/**
+ * Builds a full test narrative from the result's actions array.
+ * Returns a numbered step-by-step summary.
+ *
+ * @param {object} testResult — A single test result with actions[], name, success, error
+ * @returns {string[]} Array of narrative lines
+ */
+export function narrateTest(testResult) {
+  const lines = [];
+
+  for (let i = 0; i < testResult.actions.length; i++) {
+    const action = testResult.actions[i];
+    const narrative = action.narrative || narrateAction(action, action);
+    lines.push(`${i + 1}. ${narrative}`);
+  }
+
+  if (!testResult.success && testResult.error) {
+    const failedAt = testResult.actions.findIndex(a => !a.success);
+    if (failedAt === -1) {
+      lines.push(`✗ Test failed: ${testResult.error}`);
+    }
+  }
+
+  return lines;
+}
